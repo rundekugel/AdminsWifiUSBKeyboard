@@ -15,7 +15,7 @@ extern const unsigned char index_html_end[]   asm("_binary_index_html_end");
 extern const unsigned char wifi_html_start[]  asm("_binary_wifi_html_start");
 extern const unsigned char wifi_html_end[]    asm("_binary_wifi_html_end");
 
-#define VERSION "0.0.2a"
+#define VERSION "0.0.3"
 #define REVISION 0
 
 typedef struct {
@@ -28,6 +28,37 @@ static bool hid_enumerated = false; /* set to true when USB HID host enumerates 
 
 static bool    sta_connected = false;
 static char    sta_ip[16]    = "";
+
+/* ---- AP config (NVS) ---- */
+#define AP_CFG_NS          "ap_cfg"
+#define AP_SSID_DEFAULT    "adminKbd"
+#define AP_PASS_DEFAULT    "12345678"
+#define RECONNECT_MS_DEFAULT 2000u
+
+static char     ap_ssid[33]          = AP_SSID_DEFAULT;
+static char     ap_pass[65]          = AP_PASS_DEFAULT;
+static uint32_t reconnect_interval_ms = RECONNECT_MS_DEFAULT;
+
+static void ap_cfg_save(void){
+    nvs_handle_t h;
+    if(nvs_open(AP_CFG_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, "ssid", ap_ssid);
+    nvs_set_str(h, "pass", ap_pass);
+    nvs_set_u32(h, "reconn_ms", reconnect_interval_ms);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void ap_cfg_load(void){
+    nvs_handle_t h;
+    if(nvs_open(AP_CFG_NS, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = sizeof(ap_ssid);
+    nvs_get_str(h, "ssid", ap_ssid, &len);
+    len = sizeof(ap_pass);
+    nvs_get_str(h, "pass", ap_pass, &len);
+    nvs_get_u32(h, "reconn_ms", &reconnect_interval_ms);
+    nvs_close(h);
+}
 
 /* ---- WiFi credential storage (NVS) ---- */
 #define WIFI_CRED_NS  "wifi_cfg"
@@ -115,6 +146,45 @@ static void wifi_do_connect(int idx){
     printf("Connecting to SSID: %s\n", wifi_creds[idx].ssid);
 }
 
+/* Scan and connect to the strongest AP for which we have credentials. */
+static void wifi_connect_best(void){
+    if(wifi_cred_count == 0) return;
+
+    wifi_scan_config_t scan_cfg = {
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 100,
+        .scan_time.active.max = 300,
+    };
+    esp_wifi_scan_start(&scan_cfg, true); /* blocking */
+
+    uint16_t count = 20;
+    wifi_ap_record_t *records = malloc(count * sizeof(wifi_ap_record_t));
+    if(!records) return;
+    esp_wifi_scan_get_ap_records(&count, records);
+
+    int best_cred = -1;
+    int8_t best_rssi = -127;
+    for(int r = 0; r < count; r++){
+        for(int c = 0; c < wifi_cred_count; c++){
+            if(strcmp((char*)records[r].ssid, wifi_creds[c].ssid) == 0){
+                if(records[r].rssi > best_rssi){
+                    best_rssi = records[r].rssi;
+                    best_cred = c;
+                }
+                break;
+            }
+        }
+    }
+    free(records);
+
+    if(best_cred >= 0){
+        printf("Best known AP: %s (RSSI %d)\n", wifi_creds[best_cred].ssid, best_rssi);
+        wifi_do_connect(best_cred);
+    } else {
+        printf("No known AP in range\n");
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data){
     if(base == IP_EVENT && id == IP_EVENT_STA_GOT_IP){
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
@@ -134,6 +204,8 @@ static void wifi_init_ap(void){
         nvs_flash_erase();
         nvs_flash_init();
     }
+    ap_cfg_load();
+
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_ap();
@@ -145,20 +217,17 @@ static void wifi_init_ap(void){
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,      wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP,   wifi_event_handler, NULL);
 
-    wifi_config_t ap = {
-        .ap = {
-            .ssid = "ESP-MACRO",
-            .password = "12345678",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK
-        }
-    };
+    wifi_config_t ap = { .ap = { .max_connection = 4, .authmode = WIFI_AUTH_WPA_WPA2_PSK } };
+    strncpy((char*)ap.ap.ssid,     ap_ssid, sizeof(ap.ap.ssid)-1);
+    strncpy((char*)ap.ap.password, ap_pass, sizeof(ap.ap.password)-1);
+    ap.ap.ssid_len = (uint8_t)strlen(ap_ssid);
+
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &ap);
     esp_wifi_start();
 
     creds_load();
-    if(wifi_cred_count > 0) wifi_do_connect(0);
+    if(wifi_cred_count > 0) wifi_connect_best();
 }
 
 static void backend_send(const char *s){
@@ -388,10 +457,78 @@ static esp_err_t wifi_scan_get(httpd_req_t *req){
     return ESP_OK;
 }
 
+/* Reconnect task: retries esp_wifi_connect() when STA is down. */
+static void reconnect_task(void *arg){
+    (void)arg;
+    while(1){
+        vTaskDelay(pdMS_TO_TICKS(reconnect_interval_ms));
+        if(!sta_connected && wifi_cred_count > 0){
+            printf("Reconnecting...\n");
+            esp_wifi_connect();
+        }
+    }
+}
+
+/* ---- HTTP handlers for AP config and reconnect interval ---- */
+
+static esp_err_t wifi_ap_get(httpd_req_t *req){
+    char out[192];
+    snprintf(out, sizeof(out), "{\"ssid\":\"%s\",\"pass\":\"%s\",\"reconn_ms\":%lu}",
+             ap_ssid, ap_pass, (unsigned long)reconnect_interval_ms);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+static esp_err_t wifi_ap_post(httpd_req_t *req){
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
+    if(len < 0) len = 0;
+    buf[len] = 0;
+
+    char *sep = strchr(buf, '|');
+    if(!sep){ httpd_resp_sendstr(req, "ERR"); return ESP_OK; }
+    *sep = 0;
+    strncpy(ap_ssid, buf,   sizeof(ap_ssid)-1);
+    strncpy(ap_pass, sep+1, sizeof(ap_pass)-1);
+    ap_cfg_save();
+
+    /* Apply new AP config live */
+    wifi_config_t ap = { .ap = { .max_connection = 4, .authmode = WIFI_AUTH_WPA_WPA2_PSK } };
+    strncpy((char*)ap.ap.ssid,     ap_ssid, sizeof(ap.ap.ssid)-1);
+    strncpy((char*)ap.ap.password, ap_pass, sizeof(ap.ap.password)-1);
+    ap.ap.ssid_len = (uint8_t)strlen(ap_ssid);
+    esp_wifi_set_config(WIFI_IF_AP, &ap);
+
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t wifi_reconn_interval_get(httpd_req_t *req){
+    char out[32];
+    snprintf(out, sizeof(out), "{\"reconn_ms\":%lu}", (unsigned long)reconnect_interval_ms);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+static esp_err_t wifi_reconn_interval_post(httpd_req_t *req){
+    char buf[16];
+    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
+    if(len < 0) len = 0;
+    buf[len] = 0;
+    uint32_t ms = (uint32_t)atoi(buf);
+    if(ms < 500) ms = 500;   /* minimum 0.5 s */
+    reconnect_interval_ms = ms;
+    ap_cfg_save();
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static void web_start(void){
     httpd_handle_t server=NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 20;
     httpd_start(&server,&cfg);
 
     httpd_uri_t u1={.uri="/",.method=HTTP_GET,.handler=root_get};
@@ -407,6 +544,10 @@ static void web_start(void){
     httpd_uri_t u11={.uri="/wifi/delete",.method=HTTP_POST,.handler=wifi_delete_post};
     httpd_uri_t u12={.uri="/wifi/connect_idx",.method=HTTP_POST,.handler=wifi_connect_idx_post};
     httpd_uri_t u13={.uri="/wifi/scan",.method=HTTP_GET,.handler=wifi_scan_get};
+    httpd_uri_t u14={.uri="/wifi/ap",.method=HTTP_GET,.handler=wifi_ap_get};
+    httpd_uri_t u15={.uri="/wifi/ap",.method=HTTP_POST,.handler=wifi_ap_post};
+    httpd_uri_t u16={.uri="/wifi/reconnect_interval",.method=HTTP_GET,.handler=wifi_reconn_interval_get};
+    httpd_uri_t u17={.uri="/wifi/reconnect_interval",.method=HTTP_POST,.handler=wifi_reconn_interval_post};
 
     httpd_register_uri_handler(server,&u1);
     httpd_register_uri_handler(server,&u2);
@@ -421,10 +562,16 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u11);
     httpd_register_uri_handler(server,&u12);
     httpd_register_uri_handler(server,&u13);
+    httpd_register_uri_handler(server,&u14);
+    httpd_register_uri_handler(server,&u15);
+    httpd_register_uri_handler(server,&u16);
+    httpd_register_uri_handler(server,&u17);
 }
 
 void app_main(void){
     wifi_init_ap();
     web_start();
-    printf("AP: ESP-MACRO  PASS:12345678\n");
+    xTaskCreate(reconnect_task, "reconn", 4096, NULL, 5, NULL);
+
+    printf("AP: %s  PASS:%s  reconn_ms:%lu\n", ap_ssid, ap_pass, (unsigned long)reconnect_interval_ms);
 }
