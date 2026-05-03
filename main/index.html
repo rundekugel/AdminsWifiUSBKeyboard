@@ -1,0 +1,178 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>ESP Macro</title>
+<style>
+body{font-family:Arial;margin:20px}
+textarea,input[type=text],input[type=password],input:not([type]){width:100%;margin:4px 0;box-sizing:border-box}
+#modifiers label{display:inline-block;margin:4px 8px 4px 0}
+//#modifiers send2_immediately{display:inline-block;margin:4px 8px 4px 0}
+#modifiers input{width:auto;margin:0 4px 0 0}
+button{margin:4px;padding:8px}
+.card{border:1px solid #ccc;padding:10px;margin:8px 0}
+#statusBar{display:flex;gap:20px;padding:6px 10px;background:#f0f0f0;border-radius:4px;margin-bottom:8px;font-size:0.9em}
+.st-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#ccc;margin-right:5px;vertical-align:middle}
+.st-dot.on{background:#2a2}
+.st-dot.off{background:#c44}
+#lockStatus{margin:6px 0}
+#lockStatus span{display:inline-block;padding:2px 8px;margin:2px 2px 2px 0;border:1px solid #999;border-radius:3px;font-size:0.8em;font-weight:bold;opacity:0.3;background:#eee}
+#lockStatus span.on{opacity:1;background:#2a2;color:#fff;border-color:#2a2}
+</style>
+</head>
+<body>
+<h2>ESP Macro Console V0.0.2</h2>
+<p><a href="/wifi">&#9881; WiFi Settings</a></p>
+<div id="statusBar">
+  <span><span class="st-dot" id="dot_hid"></span><strong>USB HID:</strong> <span id="st_hid">…</span></span>
+  <span><span class="st-dot" id="dot_wifi"></span><strong>WiFi Clients:</strong> <span id="st_clients">…</span></span>
+  <span><span class="st-dot" id="dot_sta"></span><strong>WiFi STA:</strong> <span id="st_sta">…</span></span>
+</div>
+
+<div class="card">
+<h3>Send Text</h3>
+<textarea id="txt" rows="4"></textarea>
+<br>
+<button onclick="sendText()">Send</button>
+</div>
+
+<div class="card">
+<h3>Key + Modifiers</h3>
+<div id="modifiers">
+  <label><input type="checkbox" id="mod_lctrl"> Left Ctrl</label>
+  <label><input type="checkbox" id="mod_rctrl"> Right Ctrl</label>
+  <label><input type="checkbox" id="mod_lshift"> Left Shift</label>
+  <label><input type="checkbox" id="mod_rshift"> Right Shift</label>
+  <label><input type="checkbox" id="mod_lalt"> Left Alt</label>
+  <label><input type="checkbox" id="mod_ralt"> Right Alt</label>
+  <label><input type="checkbox" id="mod_super"> Super</label>
+</div>
+Keys to be sent: <input id="keyname" placeholder="Key (e.g. A, ENTER, F1)" >
+<div id="lockStatus">
+  <span id="lk_caps">CAPS</span>
+  <span id="lk_num">NUM</span>
+  <span id="lk_scrl">SCRL</span>
+</div>
+
+<input type="checkbox" id="send_immediately" checked="1"/>Send keys immediately
+
+
+<br>
+<button onclick="sendCombo()">Send</button>
+<hr>
+<div><strong>Log:</strong> <button onclick="comboLog.value=''">Clear</button></div>
+<textarea id="comboLog" rows="5" readonly style="background:#f5f5f5;font-family:monospace;font-size:0.85em"></textarea>
+</div>
+
+<div class="card">
+<h3>Save Macro</h3>
+<input id="name" placeholder="Macro Name">
+<textarea id="body" rows="8">STRING hello
+KEY ENTER</textarea>
+<button onclick="saveMacro()">Save</button>
+</div>
+
+<div class="card">
+<h3>Macros</h3>
+<div id="list"></div>
+</div>
+
+<script>
+const MOD_LIST=[
+ ['mod_lctrl','LCTRL'],['mod_rctrl','RCTRL'],
+ ['mod_lshift','LSHIFT'],['mod_rshift','RSHIFT'],
+ ['mod_lalt','LALT'],['mod_ralt','RALT'],
+ ['mod_super','SUPER']
+];
+// Keys that are modifiers themselves — don't send as payload
+const SKIP_KEYS=new Set(['Control','Shift','Alt','Meta','AltGraph','Dead','Unidentified','Process']);
+
+function normalizeKey(k){
+ if(k===' ') return 'SPACE';
+ // e.g. ArrowRight→ARROWRIGHT, CapsLock→CAPSLOCK, PageUp→PAGEUP, F2→F2
+ return k.replace(/\s/g,'').toUpperCase();
+}
+
+function buildCmdForKey(keyStr){
+ const active=MOD_LIST.filter(([id])=>document.getElementById(id).checked).map(([,name])=>name);
+ if(!keyStr) return null;
+ const parts=[...active,keyStr].join('+');
+ return active.length?'COMBO '+parts:'KEY '+keyStr;
+}
+function buildComboCmd(){
+ return buildCmdForKey(normalizeKey(document.getElementById('keyname').value.trim()));
+}
+function logCombo(cmd){
+ const ts=new Date().toLocaleTimeString();
+ comboLog.value=ts+' > '+cmd+'\n'+comboLog.value;
+}
+async function sendCombo(){
+ const cmd=buildComboCmd();
+ if(!cmd) return;
+ await fetch('/send',{method:'POST',body:cmd});
+ logCombo(cmd);
+}
+
+function updateLockStatus(e){
+ [['CapsLock','lk_caps'],['NumLock','lk_num'],['ScrollLock','lk_scrl']].forEach(([mod,id])=>{
+  const el=document.getElementById(id);
+  if(el) el.className=e.getModifierState(mod)?'on':'';
+ });
+}
+
+document.addEventListener('DOMContentLoaded',()=>{
+ document.getElementById('keyname').addEventListener('keydown',function(e){
+  updateLockStatus(e);
+  if(!document.getElementById('send_immediately').checked) return;
+  if(SKIP_KEYS.has(e.key)) return;
+  e.preventDefault();
+  const keyStr=normalizeKey(e.key);
+  const cmd=buildCmdForKey(keyStr);
+  if(!cmd) return;
+  fetch('/send',{method:'POST',body:cmd});
+  logCombo(cmd);
+ });
+});
+
+// AJAX status polling
+async function pollStatus(){
+ try{
+  const r=await fetch('/status');
+  const j=await r.json();
+  document.getElementById('st_hid').textContent=j.hid?'Enumerated':'Not connected';
+  document.getElementById('dot_hid').className='st-dot '+(j.hid?'on':'off');
+  document.getElementById('st_clients').textContent=j.clients;
+  document.getElementById('dot_wifi').className='st-dot '+(j.clients>0?'on':'off');
+  document.getElementById('st_sta').textContent=j.sta?(j.ip||'connected'):'Not connected';
+  document.getElementById('dot_sta').className='st-dot '+(j.sta?'on':'off');
+ }catch(err){
+  ['st_hid','st_clients','st_sta'].forEach(id=>document.getElementById(id).textContent='?');
+ }
+}
+setInterval(pollStatus,2000);
+pollStatus();
+async function sendText(){
+ await fetch('/send',{method:'POST',body:txt.value});
+}
+async function saveMacro(){
+ await fetch('/macro/save',{method:'POST',body:name.value+'|'+body.value});
+ load();
+}
+async function runMacro(id){
+ await fetch('/macro/run',{method:'POST',body:''+id});
+}
+async function load(){
+ let r=await fetch('/macro/list');
+ let j=await r.json();
+ list.innerHTML='';
+ j.forEach(m=>{
+   let d=document.createElement('div');
+   d.innerHTML='<button onclick="runMacro('+m.id+')">Run</button> '+m.name;
+   list.appendChild(d);
+ });
+}
+load();
+</script>
+</body>
+</html>
