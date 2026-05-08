@@ -9,13 +9,16 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "tinyusb.h"
+#include "tinyusb_default_config.h"
+#include "class/hid/hid_device.h"
 
 extern const unsigned char index_html_start[] asm("_binary_index_html_start");
 extern const unsigned char index_html_end[]   asm("_binary_index_html_end");
 extern const unsigned char wifi_html_start[]  asm("_binary_wifi_html_start");
 extern const unsigned char wifi_html_end[]    asm("_binary_wifi_html_end");
 
-#define VERSION "0.0.3"
+#define VERSION "0.0.2a"
 #define REVISION 0
 
 typedef struct {
@@ -24,39 +27,32 @@ typedef struct {
 } macro_t;
 
 static macro_t macros[10];
-static bool hid_enumerated = false; /* set to true when USB HID host enumerates the device */
+static bool    hid_enumerated = false;
+static uint8_t hid_led_state  = 0;  /* bits: 0=NumLock 1=CapsLock 2=ScrollLock */
 
 static bool    sta_connected = false;
 static char    sta_ip[16]    = "";
 
 /* ---- AP config (NVS) ---- */
-#define AP_CFG_NS          "ap_cfg"
-#define AP_SSID_DEFAULT    "adminKbd"
-#define AP_PASS_DEFAULT    "12345678"
-#define RECONNECT_MS_DEFAULT 2000u
+#define AP_CFG_NS "ap_cfg"
+static char ap_ssid[33] = "ESP-MACRO";
+static char ap_pass[65] = "12345678";
 
-static char     ap_ssid[33]          = AP_SSID_DEFAULT;
-static char     ap_pass[65]          = AP_PASS_DEFAULT;
-static uint32_t reconnect_interval_ms = RECONNECT_MS_DEFAULT;
-
-static void ap_cfg_save(void){
+static void ap_cfg_load(void) {
     nvs_handle_t h;
-    if(nvs_open(AP_CFG_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_str(h, "ssid", ap_ssid);
-    nvs_set_str(h, "pass", ap_pass);
-    nvs_set_u32(h, "reconn_ms", reconnect_interval_ms);
-    nvs_commit(h);
+    if (nvs_open(AP_CFG_NS, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len;
+    len = sizeof(ap_ssid); nvs_get_str(h, "ssid", ap_ssid, &len);
+    len = sizeof(ap_pass); nvs_get_str(h, "pass", ap_pass, &len);
     nvs_close(h);
 }
 
-static void ap_cfg_load(void){
+static void ap_cfg_save(void) {
     nvs_handle_t h;
-    if(nvs_open(AP_CFG_NS, NVS_READONLY, &h) != ESP_OK) return;
-    size_t len = sizeof(ap_ssid);
-    nvs_get_str(h, "ssid", ap_ssid, &len);
-    len = sizeof(ap_pass);
-    nvs_get_str(h, "pass", ap_pass, &len);
-    nvs_get_u32(h, "reconn_ms", &reconnect_interval_ms);
+    if (nvs_open(AP_CFG_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, "ssid", ap_ssid);
+    nvs_set_str(h, "pass", ap_pass);
+    nvs_commit(h);
     nvs_close(h);
 }
 
@@ -68,6 +64,127 @@ typedef struct { char ssid[33]; char pass[65]; } wifi_cred_t;
 static wifi_cred_t wifi_creds[WIFI_CRED_MAX];
 static int         wifi_cred_count = 0;
 
+/* ---- USB HID descriptors ---- */
+#define HID_REPORT_ID_KEYBOARD 1
+#define HID_REPORT_ID_CONSUMER 2
+#define EPNUM_HID              0x81
+
+static const uint8_t s_hid_report_descriptor[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(HID_REPORT_ID_KEYBOARD)),
+    TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(HID_REPORT_ID_CONSUMER))
+};
+
+/* Mutable USB device identity — overwritten from NVS before USB init */
+static char s_manufacturer[64] = "Espressif";
+static char s_product[64]      = "ESP32-S3 Keyboard";
+static char s_serial[32]       = "ESP-MACRO-001";
+
+static tusb_desc_device_t s_device_descriptor = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,
+    .bDeviceClass       = 0,
+    .bDeviceSubClass    = 0,
+    .bDeviceProtocol    = 0,
+    .bMaxPacketSize0    = 64,
+    .idVendor           = 0x303A,
+    .idProduct          = 0x4004,
+    .bcdDevice          = 0x0100,
+    .iManufacturer      = 1,
+    .iProduct           = 2,
+    .iSerialNumber      = 3,
+    .bNumConfigurations = 1,
+};
+
+#define HID_CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+
+static const uint8_t s_hid_config_descriptor[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, HID_CONFIG_TOTAL_LEN,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD,
+                       sizeof(s_hid_report_descriptor), EPNUM_HID, 64, 10),
+};
+
+static const char *s_string_descriptor[] = {
+    "\x09\x04",      /* 0: language (English) */
+    s_manufacturer,  /* 1: Manufacturer */
+    s_product,       /* 2: Product */
+    s_serial,        /* 3: Serial */
+};
+
+/* ---- USB config (NVS) ---- */
+#define USB_CFG_NS "usb_cfg"
+
+static void usb_cfg_load(void) {
+    nvs_handle_t h;
+    if (nvs_open(USB_CFG_NS, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len;
+    len = sizeof(s_manufacturer); nvs_get_str(h, "mfr",     s_manufacturer, &len);
+    len = sizeof(s_product);      nvs_get_str(h, "product",  s_product,      &len);
+    len = sizeof(s_serial);       nvs_get_str(h, "serial",   s_serial,       &len);
+    uint16_t vid = 0, pid = 0;
+    if (nvs_get_u16(h, "vid", &vid) == ESP_OK) s_device_descriptor.idVendor  = vid;
+    if (nvs_get_u16(h, "pid", &pid) == ESP_OK) s_device_descriptor.idProduct = pid;
+    nvs_close(h);
+}
+
+static void usb_cfg_save(void) {
+    nvs_handle_t h;
+    if (nvs_open(USB_CFG_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, "mfr",     s_manufacturer);
+    nvs_set_str(h, "product", s_product);
+    nvs_set_str(h, "serial",  s_serial);
+    nvs_set_u16(h, "vid",     s_device_descriptor.idVendor);
+    nvs_set_u16(h, "pid",     s_device_descriptor.idProduct);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* ---- Delayed restart helper ---- */
+static void restart_task(void *arg) {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static void schedule_restart(void) {
+    xTaskCreate(restart_task, "restart", 1024, NULL, 5, NULL);
+}
+
+/* ---- TinyUSB callbacks ---- */
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
+    (void)instance;
+    return s_hid_report_descriptor;
+}
+
+static void usb_event_cb(tinyusb_event_t *event, void *arg) {
+    (void)arg;
+    if (event->id == TINYUSB_EVENT_ATTACHED) {
+        hid_enumerated = true;
+        printf("USB HID mounted\n");
+    } else if (event->id == TINYUSB_EVENT_DETACHED) {
+        hid_enumerated = false;
+        printf("USB HID unmounted\n");
+    }
+}
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                                hid_report_type_t report_type,
+                                uint8_t *buffer, uint16_t reqlen) {
+    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)reqlen;
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                            hid_report_type_t report_type,
+                            uint8_t const *buffer, uint16_t bufsize) {
+    (void)instance; (void)report_id;
+    if (report_type == HID_REPORT_TYPE_OUTPUT && bufsize >= 1) {
+        hid_led_state = buffer[0];
+    }
+}
+
+/* ---- WiFi credential storage ---- */
 static void creds_save(void){
     nvs_handle_t h;
     if(nvs_open(WIFI_CRED_NS, NVS_READWRITE, &h) != ESP_OK) return;
@@ -102,8 +219,6 @@ static void creds_load(void){
     nvs_close(h);
 }
 
-/* Add or update credential. If SSID exists, update password.
-   If full, evict oldest (index 0) to make room. */
 static void creds_add(const char *ssid, const char *pass){
     for(int i = 0; i < wifi_cred_count; i++){
         if(strcmp(wifi_creds[i].ssid, ssid) == 0){
@@ -113,7 +228,6 @@ static void creds_add(const char *ssid, const char *pass){
         }
     }
     if(wifi_cred_count == WIFI_CRED_MAX){
-        /* shift out oldest */
         memmove(&wifi_creds[0], &wifi_creds[1], sizeof(wifi_cred_t) * (WIFI_CRED_MAX - 1));
         wifi_cred_count--;
     }
@@ -146,45 +260,6 @@ static void wifi_do_connect(int idx){
     printf("Connecting to SSID: %s\n", wifi_creds[idx].ssid);
 }
 
-/* Scan and connect to the strongest AP for which we have credentials. */
-static void wifi_connect_best(void){
-    if(wifi_cred_count == 0) return;
-
-    wifi_scan_config_t scan_cfg = {
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
-    };
-    esp_wifi_scan_start(&scan_cfg, true); /* blocking */
-
-    uint16_t count = 20;
-    wifi_ap_record_t *records = malloc(count * sizeof(wifi_ap_record_t));
-    if(!records) return;
-    esp_wifi_scan_get_ap_records(&count, records);
-
-    int best_cred = -1;
-    int8_t best_rssi = -127;
-    for(int r = 0; r < count; r++){
-        for(int c = 0; c < wifi_cred_count; c++){
-            if(strcmp((char*)records[r].ssid, wifi_creds[c].ssid) == 0){
-                if(records[r].rssi > best_rssi){
-                    best_rssi = records[r].rssi;
-                    best_cred = c;
-                }
-                break;
-            }
-        }
-    }
-    free(records);
-
-    if(best_cred >= 0){
-        printf("Best known AP: %s (RSSI %d)\n", wifi_creds[best_cred].ssid, best_rssi);
-        wifi_do_connect(best_cred);
-    } else {
-        printf("No known AP in range\n");
-    }
-}
-
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data){
     if(base == IP_EVENT && id == IP_EVENT_STA_GOT_IP){
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
@@ -199,13 +274,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 }
 
 static void wifi_init_ap(void){
-    esp_err_t ret = nvs_flash_init();
-    if(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND){
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-    ap_cfg_load();
-
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_ap();
@@ -217,45 +285,227 @@ static void wifi_init_ap(void){
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,      wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP,   wifi_event_handler, NULL);
 
-    wifi_config_t ap = { .ap = { .max_connection = 4, .authmode = WIFI_AUTH_WPA_WPA2_PSK } };
-    strncpy((char*)ap.ap.ssid,     ap_ssid, sizeof(ap.ap.ssid)-1);
-    strncpy((char*)ap.ap.password, ap_pass, sizeof(ap.ap.password)-1);
-    ap.ap.ssid_len = (uint8_t)strlen(ap_ssid);
+    wifi_config_t apcfg = {};
+    strncpy((char*)apcfg.ap.ssid,     ap_ssid, sizeof(apcfg.ap.ssid)-1);
+    strncpy((char*)apcfg.ap.password, ap_pass,  sizeof(apcfg.ap.password)-1);
+    apcfg.ap.max_connection = 4;
+    apcfg.ap.authmode = (strlen(ap_pass) >= 8) ? WIFI_AUTH_WPA_WPA2_PSK : WIFI_AUTH_OPEN;
 
     esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_wifi_set_config(WIFI_IF_AP, &ap);
+    esp_wifi_set_config(WIFI_IF_AP, &apcfg);
     esp_wifi_start();
 
     creds_load();
-    if(wifi_cred_count > 0) wifi_connect_best();
+    if(wifi_cred_count > 0) wifi_do_connect(0);
 }
 
-static void backend_send(const char *s){
-#if CONFIG_IDF_TARGET_ESP32C2
-    printf("[C2 TEST OUTPUT] %s\n", s);
-#else
-    printf("[USB HID PLACEHOLDER] %s\n", s);
-#endif
+/* ---- HID keyboard helpers ---- */
+static bool ascii_to_hid(char c, uint8_t *keycode, uint8_t *modifier) {
+    *modifier = 0;
+    *keycode  = 0;
+    if (c >= 'a' && c <= 'z') { *keycode = HID_KEY_A + (c - 'a'); return true; }
+    if (c >= 'A' && c <= 'Z') { *keycode = HID_KEY_A + (c - 'A'); *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true; }
+    if (c >= '1' && c <= '9') { *keycode = HID_KEY_1 + (c - '1'); return true; }
+    switch (c) {
+        case '0':  *keycode = HID_KEY_0;             return true;
+        case ' ':  *keycode = HID_KEY_SPACE;          return true;
+        case '\n': *keycode = HID_KEY_ENTER;          return true;
+        case '\t': *keycode = HID_KEY_TAB;            return true;
+        case '-':  *keycode = HID_KEY_MINUS;          return true;
+        case '=':  *keycode = HID_KEY_EQUAL;          return true;
+        case '[':  *keycode = HID_KEY_BRACKET_LEFT;   return true;
+        case ']':  *keycode = HID_KEY_BRACKET_RIGHT;  return true;
+        case '\\': *keycode = HID_KEY_BACKSLASH;      return true;
+        case ';':  *keycode = HID_KEY_SEMICOLON;      return true;
+        case '\'': *keycode = HID_KEY_APOSTROPHE;     return true;
+        case '`':  *keycode = HID_KEY_GRAVE;          return true;
+        case ',':  *keycode = HID_KEY_COMMA;          return true;
+        case '.':  *keycode = HID_KEY_PERIOD;         return true;
+        case '/':  *keycode = HID_KEY_SLASH;          return true;
+        case '!':  *keycode = HID_KEY_1;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '@':  *keycode = HID_KEY_2;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '#':  *keycode = HID_KEY_3;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '$':  *keycode = HID_KEY_4;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '%':  *keycode = HID_KEY_5;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '^':  *keycode = HID_KEY_6;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '&':  *keycode = HID_KEY_7;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '*':  *keycode = HID_KEY_8;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '(':  *keycode = HID_KEY_9;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case ')':  *keycode = HID_KEY_0;             *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '_':  *keycode = HID_KEY_MINUS;         *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '+':  *keycode = HID_KEY_EQUAL;         *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '{':  *keycode = HID_KEY_BRACKET_LEFT;  *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '}':  *keycode = HID_KEY_BRACKET_RIGHT; *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '|':  *keycode = HID_KEY_BACKSLASH;     *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case ':':  *keycode = HID_KEY_SEMICOLON;     *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '"':  *keycode = HID_KEY_APOSTROPHE;    *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '<':  *keycode = HID_KEY_COMMA;         *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '>':  *keycode = HID_KEY_PERIOD;        *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '?':  *keycode = HID_KEY_SLASH;         *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+        case '~':  *keycode = HID_KEY_GRAVE;         *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return true;
+    }
+    return false;
+}
+
+static uint8_t keyname_to_hid(const char *name) {
+    if (!strcasecmp(name, "ENTER") || !strcasecmp(name, "RETURN")) return HID_KEY_ENTER;
+    if (!strcasecmp(name, "ESC")   || !strcasecmp(name, "ESCAPE")) return HID_KEY_ESCAPE;
+    if (!strcasecmp(name, "BACKSPACE"))              return HID_KEY_BACKSPACE;
+    if (!strcasecmp(name, "TAB"))                    return HID_KEY_TAB;
+    if (!strcasecmp(name, "SPACE"))                  return HID_KEY_SPACE;
+    if (!strcasecmp(name, "DELETE"))                 return HID_KEY_DELETE;
+    if (!strcasecmp(name, "INSERT"))                 return HID_KEY_INSERT;
+    if (!strcasecmp(name, "HOME"))                   return HID_KEY_HOME;
+    if (!strcasecmp(name, "END"))                    return HID_KEY_END;
+    if (!strcasecmp(name, "PAGEUP"))                 return HID_KEY_PAGE_UP;
+    if (!strcasecmp(name, "PAGEDOWN"))               return HID_KEY_PAGE_DOWN;
+    if (!strcasecmp(name, "UP")    || !strcasecmp(name, "ARROWUP"))    return HID_KEY_ARROW_UP;
+    if (!strcasecmp(name, "DOWN")  || !strcasecmp(name, "ARROWDOWN"))  return HID_KEY_ARROW_DOWN;
+    if (!strcasecmp(name, "LEFT")  || !strcasecmp(name, "ARROWLEFT"))  return HID_KEY_ARROW_LEFT;
+    if (!strcasecmp(name, "RIGHT") || !strcasecmp(name, "ARROWRIGHT")) return HID_KEY_ARROW_RIGHT;
+    if (!strcasecmp(name, "CAPSLOCK"))               return HID_KEY_CAPS_LOCK;
+    if (!strcasecmp(name, "PRINTSCREEN"))            return HID_KEY_PRINT_SCREEN;
+    if (!strcasecmp(name, "SCROLLLOCK"))             return HID_KEY_SCROLL_LOCK;
+    if (!strcasecmp(name, "PAUSE"))                  return HID_KEY_PAUSE;
+    if (!strcasecmp(name, "NUMLOCK"))                return HID_KEY_NUM_LOCK;
+    /* F1-F12 */
+    if ((name[0] == 'F' || name[0] == 'f') && name[1] >= '1' && name[1] <= '9') {
+        int fn = atoi(name + 1);
+        if (fn >= 1 && fn <= 12) return HID_KEY_F1 + (fn - 1);
+    }
+    /* Single letter A-Z (key position, no shift) */
+    if (name[0] && !name[1]) {
+        char c = name[0];
+        if (c >= 'A' && c <= 'Z') return HID_KEY_A + (c - 'A');
+        if (c >= 'a' && c <= 'z') return HID_KEY_A + (c - 'a');
+        if (c >= '1' && c <= '9') return HID_KEY_1 + (c - '1');
+        if (c == '0') return HID_KEY_0;
+    }
+    return 0;
+}
+
+static uint8_t modname_to_modifier(const char *name) {
+    if (!strcasecmp(name, "CTRL")   || !strcasecmp(name, "CONTROL") ||
+        !strcasecmp(name, "LCTRL"))  return KEYBOARD_MODIFIER_LEFTCTRL;
+    if (!strcasecmp(name, "RCTRL"))  return KEYBOARD_MODIFIER_RIGHTCTRL;
+    if (!strcasecmp(name, "SHIFT")  || !strcasecmp(name, "LSHIFT")) return KEYBOARD_MODIFIER_LEFTSHIFT;
+    if (!strcasecmp(name, "RSHIFT")) return KEYBOARD_MODIFIER_RIGHTSHIFT;
+    if (!strcasecmp(name, "ALT")    || !strcasecmp(name, "LALT"))   return KEYBOARD_MODIFIER_LEFTALT;
+    if (!strcasecmp(name, "RALT"))   return KEYBOARD_MODIFIER_RIGHTALT;
+    if (!strcasecmp(name, "GUI") || !strcasecmp(name, "WIN") ||
+        !strcasecmp(name, "SUPER") || !strcasecmp(name, "META")) return KEYBOARD_MODIFIER_LEFTGUI;
+    return 0;
+}
+
+static bool hid_wait_ready(void) {
+    for (int i = 0; i < 20 && !tud_hid_ready(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return tud_hid_ready();
+}
+
+static void hid_press_key(uint8_t modifier, uint8_t keycode) {
+    if (!hid_wait_ready()) return;
+    uint8_t keys[6] = {keycode, 0, 0, 0, 0, 0};
+    tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, modifier, keys);
+    /* Always send release — wait for endpoint ready again first */
+    vTaskDelay(pdMS_TO_TICKS(10));
+    hid_wait_ready();
+    tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, 0, NULL);
+    vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+static void hid_consumer_key(uint16_t usage) {
+    if (!hid_wait_ready()) return;
+    tud_hid_report(HID_REPORT_ID_CONSUMER, (uint8_t *)&usage, 2);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    hid_wait_ready();
+    uint16_t release = 0;
+    tud_hid_report(HID_REPORT_ID_CONSUMER, (uint8_t *)&release, 2);
+    vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+static uint16_t medianame_to_usage(const char *name) {
+    if (!strcasecmp(name, "PLAY_PAUSE") || !strcasecmp(name, "PLAYPAUSE") || !strcasecmp(name, "PLAY"))
+        return HID_USAGE_CONSUMER_PLAY_PAUSE;
+    if (!strcasecmp(name, "NEXT") || !strcasecmp(name, "NEXT_TRACK") || !strcasecmp(name, "FORWARD"))
+        return HID_USAGE_CONSUMER_SCAN_NEXT_TRACK;
+    if (!strcasecmp(name, "PREV") || !strcasecmp(name, "PREV_TRACK") || !strcasecmp(name, "BACKWARD") || !strcasecmp(name, "PREVIOUS"))
+        return HID_USAGE_CONSUMER_SCAN_PREVIOUS_TRACK;
+    if (!strcasecmp(name, "VOL_UP") || !strcasecmp(name, "VOLUME_UP") || !strcasecmp(name, "VOLUMEUP"))
+        return HID_USAGE_CONSUMER_VOLUME_INCREMENT;
+    if (!strcasecmp(name, "VOL_DOWN") || !strcasecmp(name, "VOLUME_DOWN") || !strcasecmp(name, "VOLUMEDOWN"))
+        return HID_USAGE_CONSUMER_VOLUME_DECREMENT;
+    if (!strcasecmp(name, "MUTE"))
+        return HID_USAGE_CONSUMER_MUTE;
+    return 0;
+}
+
+static void backend_send(const char *s) {
+    if (strncmp(s, "MEDIA ", 6) == 0) {
+        uint16_t usage = medianame_to_usage(s + 6);
+        if (usage) hid_consumer_key(usage);
+        else printf("[HID] Unknown media key: %s\n", s + 6);
+        return;
+    } else if (strncmp(s, "KEY ", 4) == 0) {
+        uint8_t kc = keyname_to_hid(s + 4);
+        if (kc) hid_press_key(0, kc);
+        else printf("[HID] Unknown key: %s\n", s + 4);
+    } else if (strncmp(s, "COMBO ", 6) == 0) {
+        char combo[64];
+        strncpy(combo, s + 6, sizeof(combo) - 1);
+        combo[sizeof(combo) - 1] = 0;
+        uint8_t modifier = 0, keycode = 0;
+        char *saveptr;
+        char *tok = strtok_r(combo, "+", &saveptr);
+        while (tok) {
+            while (*tok == ' ') tok++;
+            uint8_t mod = modname_to_modifier(tok);
+            if (mod) {
+                modifier |= mod;
+            } else {
+                uint8_t kc = keyname_to_hid(tok);
+                if (!kc && tok[0] && !tok[1]) {
+                    uint8_t dummy_mod;
+                    ascii_to_hid(tok[0], &kc, &dummy_mod);
+                }
+                if (kc) keycode = kc;
+            }
+            tok = strtok_r(NULL, "+", &saveptr);
+        }
+        if (keycode) hid_press_key(modifier, keycode);
+    } else {
+        /* Plain text: type character by character */
+        for (const char *p = s; *p; p++) {
+            uint8_t kc, mod;
+            if (ascii_to_hid(*p, &kc, &mod)) {
+                hid_press_key(mod, kc);
+            }
+        }
+    }
 }
 
 static void run_macro_script(const char *script){
     char buf[512];
     strncpy(buf, script, sizeof(buf)-1);
-    buf[sizeof(buf)-1]=0;
+    buf[sizeof(buf)-1] = 0;
 
-    char *line = strtok(buf, "\n");
-    while(line){
-        if(strncmp(line,"STRING ",7)==0){
-            backend_send(line+7);
-        } else if(strncmp(line,"KEY ",4)==0){
+    char *saveptr;
+    char *line = strtok_r(buf, "\n", &saveptr);
+    while (line) {
+        if (strncmp(line, "STRING ", 7) == 0) {
+            backend_send(line + 7);
+        } else if (strncmp(line, "KEY ", 4) == 0) {
             backend_send(line);
-        } else if(strncmp(line,"COMBO ",6)==0){
+        } else if (strncmp(line, "COMBO ", 6) == 0) {
             backend_send(line);
-        } else if(strncmp(line,"DELAY ",6)==0){
-            int ms=atoi(line+6);
+        } else if (strncmp(line, "MEDIA ", 6) == 0) {
+            backend_send(line);
+        } else if (strncmp(line, "DELAY ", 6) == 0) {
+            int ms = atoi(line + 6);
             vTaskDelay(pdMS_TO_TICKS(ms));
         }
-        line = strtok(NULL,"\n");
+        line = strtok_r(NULL, "\n", &saveptr);
     }
 }
 
@@ -324,11 +574,12 @@ static esp_err_t status_get(httpd_req_t *req){
     wifi_sta_list_t sta;
     esp_wifi_ap_get_sta_list(&sta);
     char out[128];
-    snprintf(out, sizeof(out), "{\"hid\":%s,\"clients\":%d,\"sta\":%s,\"ip\":\"%s\"}",
+    snprintf(out, sizeof(out), "{\"hid\":%s,\"clients\":%d,\"sta\":%s,\"ip\":\"%s\",\"leds\":%d}",
              hid_enumerated ? "true" : "false",
              sta.num,
              sta_connected ? "true" : "false",
-             sta_ip);
+             sta_ip,
+             hid_led_state);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
@@ -360,7 +611,7 @@ static esp_err_t wifi_connect_post(httpd_req_t *req){
     *sep = 0;
     const char *ssid = buf, *pass = sep+1;
 
-    creds_add(ssid, pass);  /* save to NVS */
+    creds_add(ssid, pass);
 
     int idx = 0;
     for(int i = 0; i < wifi_cred_count; i++)
@@ -425,7 +676,7 @@ static esp_err_t wifi_scan_get(httpd_req_t *req){
         .scan_time.active.min = 100,
         .scan_time.active.max = 300,
     };
-    esp_wifi_scan_start(&scan_cfg, true); /* blocking */
+    esp_wifi_scan_start(&scan_cfg, true);
 
     uint16_t count = 20;
     wifi_ap_record_t *records = malloc(count * sizeof(wifi_ap_record_t));
@@ -457,71 +708,62 @@ static esp_err_t wifi_scan_get(httpd_req_t *req){
     return ESP_OK;
 }
 
-/* Reconnect task: retries esp_wifi_connect() when STA is down. */
-static void reconnect_task(void *arg){
-    (void)arg;
-    while(1){
-        vTaskDelay(pdMS_TO_TICKS(reconnect_interval_ms));
-        if(!sta_connected && wifi_cred_count > 0){
-            printf("Reconnecting...\n");
-            esp_wifi_connect();
-        }
-    }
-}
-
-/* ---- HTTP handlers for AP config and reconnect interval ---- */
-
-static esp_err_t wifi_ap_get(httpd_req_t *req){
-    char out[192];
-    snprintf(out, sizeof(out), "{\"ssid\":\"%s\",\"pass\":\"%s\",\"reconn_ms\":%lu}",
-             ap_ssid, ap_pass, (unsigned long)reconnect_interval_ms);
+static esp_err_t usb_cfg_get_h(httpd_req_t *req) {
+    char out[256];
+    snprintf(out, sizeof(out),
+             "{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\"}",
+             s_device_descriptor.idVendor, s_device_descriptor.idProduct,
+             s_manufacturer, s_product, s_serial);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
 }
 
-static esp_err_t wifi_ap_post(httpd_req_t *req){
+static esp_err_t usb_cfg_post_h(httpd_req_t *req) {
+    char buf[256];
+    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
+    if (len < 0) len = 0;
+    buf[len] = 0;
+    /* format: VID|PID|manufacturer|product|serial  (VID/PID as hex strings) */
+    char *sp;
+    char *vid_s  = strtok_r(buf,  "|", &sp);
+    char *pid_s  = strtok_r(NULL, "|", &sp);
+    char *mfr_s  = strtok_r(NULL, "|", &sp);
+    char *prod_s = strtok_r(NULL, "|", &sp);
+    char *ser_s  = strtok_r(NULL, "|", &sp);
+    if (vid_s)  s_device_descriptor.idVendor  = (uint16_t)strtol(vid_s, NULL, 16);
+    if (pid_s)  s_device_descriptor.idProduct = (uint16_t)strtol(pid_s, NULL, 16);
+    if (mfr_s)  strncpy(s_manufacturer, mfr_s,  sizeof(s_manufacturer)-1);
+    if (prod_s) strncpy(s_product,      prod_s,  sizeof(s_product)-1);
+    if (ser_s)  strncpy(s_serial,       ser_s,   sizeof(s_serial)-1);
+    usb_cfg_save();
+    httpd_resp_sendstr(req, "OK");
+    schedule_restart();
+    return ESP_OK;
+}
+
+static esp_err_t ap_cfg_get_h(httpd_req_t *req) {
+    char out[128];
+    snprintf(out, sizeof(out), "{\"ssid\":\"%s\",\"pass\":\"%s\"}", ap_ssid, ap_pass);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+static esp_err_t ap_cfg_post_h(httpd_req_t *req) {
     char buf[128];
     int len = httpd_req_recv(req, buf, sizeof(buf)-1);
-    if(len < 0) len = 0;
+    if (len < 0) len = 0;
     buf[len] = 0;
-
-    char *sep = strchr(buf, '|');
-    if(!sep){ httpd_resp_sendstr(req, "ERR"); return ESP_OK; }
-    *sep = 0;
-    strncpy(ap_ssid, buf,   sizeof(ap_ssid)-1);
-    strncpy(ap_pass, sep+1, sizeof(ap_pass)-1);
-    ap_cfg_save();
-
-    /* Apply new AP config live */
-    wifi_config_t ap = { .ap = { .max_connection = 4, .authmode = WIFI_AUTH_WPA_WPA2_PSK } };
-    strncpy((char*)ap.ap.ssid,     ap_ssid, sizeof(ap.ap.ssid)-1);
-    strncpy((char*)ap.ap.password, ap_pass, sizeof(ap.ap.password)-1);
-    ap.ap.ssid_len = (uint8_t)strlen(ap_ssid);
-    esp_wifi_set_config(WIFI_IF_AP, &ap);
-
-    httpd_resp_sendstr(req, "OK");
-    return ESP_OK;
-}
-
-static esp_err_t wifi_reconn_interval_get(httpd_req_t *req){
-    char out[32];
-    snprintf(out, sizeof(out), "{\"reconn_ms\":%lu}", (unsigned long)reconnect_interval_ms);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, out);
-    return ESP_OK;
-}
-
-static esp_err_t wifi_reconn_interval_post(httpd_req_t *req){
-    char buf[16];
-    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
-    if(len < 0) len = 0;
-    buf[len] = 0;
-    uint32_t ms = (uint32_t)atoi(buf);
-    if(ms < 500) ms = 500;   /* minimum 0.5 s */
-    reconnect_interval_ms = ms;
+    /* format: ssid|password */
+    char *sp;
+    char *ssid_s = strtok_r(buf,  "|", &sp);
+    char *pass_s = strtok_r(NULL, "|", &sp);
+    if (ssid_s) strncpy(ap_ssid, ssid_s, sizeof(ap_ssid)-1);
+    if (pass_s) strncpy(ap_pass, pass_s, sizeof(ap_pass)-1);
     ap_cfg_save();
     httpd_resp_sendstr(req, "OK");
+    schedule_restart();
     return ESP_OK;
 }
 
@@ -544,10 +786,10 @@ static void web_start(void){
     httpd_uri_t u11={.uri="/wifi/delete",.method=HTTP_POST,.handler=wifi_delete_post};
     httpd_uri_t u12={.uri="/wifi/connect_idx",.method=HTTP_POST,.handler=wifi_connect_idx_post};
     httpd_uri_t u13={.uri="/wifi/scan",.method=HTTP_GET,.handler=wifi_scan_get};
-    httpd_uri_t u14={.uri="/wifi/ap",.method=HTTP_GET,.handler=wifi_ap_get};
-    httpd_uri_t u15={.uri="/wifi/ap",.method=HTTP_POST,.handler=wifi_ap_post};
-    httpd_uri_t u16={.uri="/wifi/reconnect_interval",.method=HTTP_GET,.handler=wifi_reconn_interval_get};
-    httpd_uri_t u17={.uri="/wifi/reconnect_interval",.method=HTTP_POST,.handler=wifi_reconn_interval_post};
+    httpd_uri_t u14={.uri="/usb/config",.method=HTTP_GET,.handler=usb_cfg_get_h};
+    httpd_uri_t u15={.uri="/usb/config",.method=HTTP_POST,.handler=usb_cfg_post_h};
+    httpd_uri_t u16={.uri="/ap/config",.method=HTTP_GET,.handler=ap_cfg_get_h};
+    httpd_uri_t u17={.uri="/ap/config",.method=HTTP_POST,.handler=ap_cfg_post_h};
 
     httpd_register_uri_handler(server,&u1);
     httpd_register_uri_handler(server,&u2);
@@ -568,10 +810,27 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u17);
 }
 
+static void usb_hid_init(void) {
+    tinyusb_config_t tusb_cfg = TINYUSB_CONFIG_FULL_SPEED(usb_event_cb, NULL);
+    tusb_cfg.descriptor.device           = &s_device_descriptor;
+    tusb_cfg.descriptor.string           = s_string_descriptor;
+    tusb_cfg.descriptor.string_count     = sizeof(s_string_descriptor) / sizeof(s_string_descriptor[0]);
+    tusb_cfg.descriptor.full_speed_config = s_hid_config_descriptor;
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    printf("USB HID initialized\n");
+}
+
 void app_main(void){
+    /* NVS must be initialized before anything reads from it */
+    esp_err_t ret = nvs_flash_init();
+    if(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND){
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    ap_cfg_load();
+    usb_cfg_load();
+    usb_hid_init();
     wifi_init_ap();
     web_start();
-    xTaskCreate(reconnect_task, "reconn", 4096, NULL, 5, NULL);
-
-    printf("AP: %s  PASS:%s  reconn_ms:%lu\n", ap_ssid, ap_pass, (unsigned long)reconnect_interval_ms);
+    printf("AP: %s  PASS:%s\n", ap_ssid, ap_pass);
 }

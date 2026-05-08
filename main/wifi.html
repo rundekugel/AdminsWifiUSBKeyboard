@@ -49,6 +49,15 @@ button{margin:4px;padding:8px}
 <div id="msg"></div>
 </div>
 
+<div class="card">
+<h3>Access Point</h3>
+<label>SSID<input id="ap_ssid" type="text" placeholder="AP name"></label>
+<label>Password (min 8 chars, empty=open)<input id="ap_pass" type="text" placeholder="AP password"></label>
+<br>
+<button onclick="saveApCfg()">Save &amp; Restart</button>
+<span id="ap_msg" style="font-size:0.85em;margin-left:8px"></span>
+</div>
+
 <script>
 const AUTH=['Open','WEP','WPA','WPA2','WPA/WPA2','WPA3','WPA2/WPA3','WAPI','OWE'];
 function rssiToBars(rssi){
@@ -132,7 +141,24 @@ async function pollStatus(){
   document.getElementById('st_sta').textContent='?';
  }
 }
+async function loadApCfg(){
+ try{
+  const j=await (await fetch('/ap/config')).json();
+  document.getElementById('ap_ssid').value=j.ssid||'';
+  document.getElementById('ap_pass').value=j.pass||'';
+ }catch(e){}
+}
+async function saveApCfg(){
+ const ssid=document.getElementById('ap_ssid').value.trim();
+ const pass=document.getElementById('ap_pass').value;
+ const msg=document.getElementById('ap_msg');
+ if(!ssid){msg.textContent='SSID required.';return;}
+ msg.textContent='Saving…';
+ await fetch('/ap/config',{method:'POST',body:ssid+'|'+pass});
+ msg.textContent='Saved – restarting…';
+}
 loadNetworks();
+loadApCfg();
 setInterval(pollStatus,2000);
 pollStatus();
 </script>
