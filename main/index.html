@@ -126,6 +126,7 @@ function logCombo(cmd){
 }
 
 let s_altgr=false;
+let s_kd_sent=false; /* true when keydown already sent a command */
 document.addEventListener('DOMContentLoaded',()=>{
  document.addEventListener('keydown',e=>{ if(e.key==='AltGraph') s_altgr=true; });
  document.addEventListener('keyup',  e=>{ if(e.key==='AltGraph') s_altgr=false; });
@@ -133,8 +134,10 @@ document.addEventListener('DOMContentLoaded',()=>{
   if(!document.getElementById('send_immediately').checked) return;
   if(SKIP_KEYS.has(e.key)) return;
   e.preventDefault();
-  /* Detect physical modifiers; AltGr = RALT (on Windows fires as Ctrl+Alt) */
-  const altGr=e.getModifierState('AltGraph')||(e.altKey&&e.ctrlKey);
+  /* AltGr detection: explicit state, getModifierState, Win Ctrl+Alt,
+     or fallback: non-ASCII char on a known key position → assume RALT active */
+  const altGr=s_altgr||e.getModifierState('AltGraph')||(e.altKey&&e.ctrlKey)
+             ||(e.key.length===1&&e.key.charCodeAt(0)>127&&!!codeToKeyName(e.code));
   const physMods=[];
   if(e.shiftKey) physMods.push('LSHIFT');
   if(e.ctrlKey&&!altGr) physMods.push('LCTRL');
@@ -143,8 +146,29 @@ document.addEventListener('DOMContentLoaded',()=>{
   if(e.metaKey) physMods.push('SUPER');
   const cmd=buildCmdForCode(e.code,physMods);
   if(!cmd) return;
+  s_kd_sent=true;
   fetch('/send',{method:'POST',body:cmd});
   logCombo(cmd);
+ });
+ /* Handle mobile (Android/iOS) soft-keyboard and AltGr IME bypass:
+    - If keydown already sent → just clear any leaked character
+    - Otherwise (mobile IME / Unidentified key) → send via input event data */
+ document.getElementById('txt').addEventListener('input',function(e){
+  if(!document.getElementById('send_immediately').checked){s_kd_sent=false;return;}
+  if(!s_kd_sent){
+   if(e.inputType==='insertText'&&e.data){
+    fetch('/send',{method:'POST',body:e.data});
+    logCombo('IME: '+e.data.substring(0,20));
+   } else if(e.inputType==='deleteContentBackward'){
+    fetch('/send',{method:'POST',body:'KEY BACKSPACE'});
+    logCombo('KEY BACKSPACE');
+   } else if(e.inputType==='insertLineBreak'||e.inputType==='insertParagraph'){
+    fetch('/send',{method:'POST',body:'KEY ENTER'});
+    logCombo('KEY ENTER');
+   }
+  }
+  s_kd_sent=false;
+  this.value='';
  });
 });
 

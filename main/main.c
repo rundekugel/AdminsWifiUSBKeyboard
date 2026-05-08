@@ -11,6 +11,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "driver/gpio.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "class/hid/hid_device.h"
@@ -41,6 +42,65 @@ static char    sta_ip[16]    = "";
 static bool    s_manual_disconnect  = false; /* set when user explicitly disconnects */
 static int     s_suppress_disc      = 0;     /* suppress events from our own disconnect calls */
 static TaskHandle_t s_wifi_mgr_task = NULL;  /* wifi manager task handle */
+
+/* ---- LED status indicator ---- */
+#define LED_PIN_DEFAULT (-1)   /* -1 = disabled; configure via USB page */
+static int s_led_pin = LED_PIN_DEFAULT;
+static volatile int s_led_logical = 0;  /* last written logical level */
+
+#define LED_CMD_BOOT      0   /* 2 Hz blink while booting */
+#define LED_CMD_IDLE      1   /* off (not connected) */
+#define LED_CMD_CONNECTED 2   /* steady on */
+#define LED_CMD_FLASH     3   /* one-shot 0.7 s flash (connect attempt) */
+
+static QueueHandle_t s_led_queue;
+
+static void led_write(int v) {
+    s_led_logical = v;
+    if (s_led_pin >= 0) gpio_set_level(s_led_pin, v);
+}
+
+static void led_cmd(uint8_t c) {
+    if (s_led_queue) xQueueSend(s_led_queue, &c, pdMS_TO_TICKS(50));
+}
+
+/* Invert LED output around key-down without changing the logical state */
+static void led_key_invert(bool inv) {
+    if (s_led_pin >= 0)
+        gpio_set_level(s_led_pin, inv ? !s_led_logical : s_led_logical);
+}
+
+static void led_task(void *arg) {
+    (void)arg;
+    if (s_led_pin >= 0) {
+        gpio_config_t io = {
+            .pin_bit_mask = 1ULL << s_led_pin,
+            .mode = GPIO_MODE_OUTPUT,
+        };
+        gpio_config(&io);
+    }
+    uint8_t cmd;
+    uint8_t mode = LED_CMD_BOOT;
+    int blink = 0;
+    for (;;) {
+        TickType_t timeout = (mode == LED_CMD_BOOT) ? pdMS_TO_TICKS(250) : portMAX_DELAY;
+        if (xQueueReceive(s_led_queue, &cmd, timeout) == pdTRUE) {
+            if (cmd == LED_CMD_FLASH) {
+                led_write(1);
+                vTaskDelay(pdMS_TO_TICKS(700));
+                led_write(mode == LED_CMD_CONNECTED ? 1 : 0);
+                continue;
+            }
+            mode = cmd;
+            blink = 0;
+        }
+        switch (mode) {
+            case LED_CMD_BOOT:      blink ^= 1; led_write(blink); break;
+            case LED_CMD_IDLE:      led_write(0); break;
+            case LED_CMD_CONNECTED: led_write(1); break;
+        }
+    }
+}
 
 /* ---- Macro NVS persistence ---- */
 static void macros_load(void) {
@@ -184,6 +244,8 @@ static void usb_cfg_load(void) {
     uint16_t vid = 0, pid = 0;
     if (nvs_get_u16(h, "vid", &vid) == ESP_OK) s_device_descriptor.idVendor  = vid;
     if (nvs_get_u16(h, "pid", &pid) == ESP_OK) s_device_descriptor.idProduct = pid;
+    int8_t lp = LED_PIN_DEFAULT;
+    if (nvs_get_i8(h, "led_pin", &lp) == ESP_OK) s_led_pin = lp;
     nvs_close(h);
 }
 
@@ -195,6 +257,7 @@ static void usb_cfg_save(void) {
     nvs_set_str(h, "serial",  s_serial);
     nvs_set_u16(h, "vid",     s_device_descriptor.idVendor);
     nvs_set_u16(h, "pid",     s_device_descriptor.idProduct);
+    nvs_set_i8 (h, "led_pin", (int8_t)s_led_pin);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -318,6 +381,7 @@ static void wifi_do_connect(int idx){
     s_suppress_disc++;          /* suppress the disconnect event our call triggers */
     esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    led_cmd(LED_CMD_FLASH);     /* 0.7 s flash per connect attempt */
     esp_wifi_connect();
     printf("Connecting to SSID: %s\n", wifi_creds[idx].ssid);
 }
@@ -386,6 +450,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         esp_ip4addr_ntoa(&ev->ip_info.ip, sta_ip, sizeof(sta_ip));
         sta_connected = true;
+        led_cmd(LED_CMD_CONNECTED);
         printf("STA connected, IP: %s\n", sta_ip);
     } else if(base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED){
         sta_connected = false;
@@ -393,7 +458,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         if(s_suppress_disc > 0){ s_suppress_disc--; return; }
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t*)data;
         printf("STA disconnected reason=%d\n", d ? (int)d->reason : -1);
-        if(s_manual_disconnect){ s_manual_disconnect = false; return; }
+        if(s_manual_disconnect){ s_manual_disconnect = false; led_cmd(LED_CMD_IDLE); return; }
+        led_cmd(LED_CMD_IDLE);
         /* Wake manager task to scan and reconnect */
         if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
     }
@@ -556,6 +622,7 @@ static void hid_press_key(uint8_t modifier, uint8_t keycode) {
         printf("[HID] key-down skipped: not ready\n");
         return;
     }
+    led_key_invert(true);
     uint8_t keys[6] = {keycode, 0, 0, 0, 0, 0};
     tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, modifier, keys);
     vTaskDelay(pdMS_TO_TICKS(15));
@@ -567,11 +634,13 @@ static void hid_press_key(uint8_t modifier, uint8_t keycode) {
         }
         vTaskDelay(pdMS_TO_TICKS(5));
     }
+    led_key_invert(false);
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 static void hid_consumer_key(uint16_t usage) {
     if (!hid_wait_ready(200)) return;
+    led_key_invert(true);
     tud_hid_report(HID_REPORT_ID_CONSUMER, (uint8_t *)&usage, 2);
     vTaskDelay(pdMS_TO_TICKS(15));
     /* Release: retry until it succeeds */
@@ -582,6 +651,7 @@ static void hid_consumer_key(uint16_t usage) {
         }
         vTaskDelay(pdMS_TO_TICKS(5));
     }
+    led_key_invert(false);
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
@@ -927,11 +997,11 @@ static esp_err_t usb_page_get(httpd_req_t *req) {
 }
 
 static esp_err_t usb_cfg_get_h(httpd_req_t *req) {
-    char out[256];
+    char out[280];
     snprintf(out, sizeof(out),
-             "{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\"}",
+             "{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\",\"led_pin\":%d}",
              s_device_descriptor.idVendor, s_device_descriptor.idProduct,
-             s_manufacturer, s_product, s_serial);
+             s_manufacturer, s_product, s_serial, s_led_pin);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
@@ -944,11 +1014,13 @@ static void usb_cfg_apply(char *buf) {
     char *mfr_s  = strtok_r(NULL, "|", &sp);
     char *prod_s = strtok_r(NULL, "|", &sp);
     char *ser_s  = strtok_r(NULL, "|", &sp);
+    char *led_s  = strtok_r(NULL, "|", &sp);
     if (vid_s)  s_device_descriptor.idVendor  = (uint16_t)strtol(vid_s, NULL, 16);
     if (pid_s)  s_device_descriptor.idProduct = (uint16_t)strtol(pid_s, NULL, 16);
     if (mfr_s)  strncpy(s_manufacturer, mfr_s,  sizeof(s_manufacturer)-1);
     if (prod_s) strncpy(s_product,      prod_s,  sizeof(s_product)-1);
     if (ser_s)  strncpy(s_serial,       ser_s,   sizeof(s_serial)-1);
+    if (led_s)  s_led_pin = atoi(led_s);
     usb_cfg_save();
 }
 
@@ -1064,6 +1136,10 @@ void app_main(void){
     usb_cfg_load();
     macros_load();
 
+    /* LED task starts immediately in boot-blink mode */
+    s_led_queue = xQueueCreate(8, sizeof(uint8_t));
+    xTaskCreate(led_task, "led", 2048, NULL, 3, NULL);
+
     /* Create HID command queue and worker task BEFORE USB init */
     s_hid_queue = xQueueCreate(HID_QUEUE_DEPTH, sizeof(hid_cmd_t));
     xTaskCreate(hid_worker_task, "hid_worker", 4096, NULL, 5, NULL);
@@ -1071,5 +1147,6 @@ void app_main(void){
     usb_hid_init();
     wifi_init_ap();
     web_start();
+    led_cmd(LED_CMD_IDLE);   /* boot complete; WiFi manager will flash on connect attempts */
     printf("AP: %s  PASS:%s\n", ap_ssid, ap_pass);
 }
