@@ -85,16 +85,39 @@ const MOD_LIST=[
 ];
 const SKIP_KEYS=new Set(['Control','Shift','Alt','Meta','AltGraph','Dead','Unidentified','Process']);
 
-function normalizeKey(k){
- if(k===' ') return 'SPACE';
- return k.replace(/\s/g,'').toUpperCase();
+/* Map e.code (physical key) to HID key name understood by the firmware */
+function codeToKeyName(code){
+ let m;
+ if((m=code.match(/^Key([A-Z])$/))) return m[1];        // KeyA-KeyZ → A-Z
+ if((m=code.match(/^Digit(\d)$/))) return m[1];         // Digit0-9 → 0-9
+ if((m=code.match(/^Numpad(\d)$/))) return m[1];        // Numpad0-9 → 0-9
+ if(/^F\d+$/.test(code)) return code;                   // F1-F12
+ const map={
+  Enter:'ENTER',NumpadEnter:'ENTER',Escape:'ESC',
+  Backspace:'BACKSPACE',Tab:'TAB',Space:'SPACE',
+  Delete:'DELETE',Insert:'INSERT',Home:'HOME',End:'END',
+  PageUp:'PAGEUP',PageDown:'PAGEDOWN',
+  ArrowUp:'ARROWUP',ArrowDown:'ARROWDOWN',
+  ArrowLeft:'ARROWLEFT',ArrowRight:'ARROWRIGHT',
+  CapsLock:'CAPSLOCK',NumLock:'NUMLOCK',ScrollLock:'SCROLLLOCK',
+  PrintScreen:'PRINTSCREEN',Pause:'PAUSE',
+  Minus:'MINUS',Equal:'EQUAL',
+  BracketLeft:'BRACKETLEFT',BracketRight:'BRACKETRIGHT',
+  Backslash:'BACKSLASH',IntlBackslash:'INTLBACKSLASH',
+  Semicolon:'SEMICOLON',Quote:'APOSTROPHE',Backquote:'GRAVE',
+  Comma:'COMMA',Period:'PERIOD',Slash:'SLASH',
+ };
+ return map[code]||null;
 }
 
-function buildCmdForKey(keyStr){
- const active=MOD_LIST.filter(([id])=>document.getElementById(id).checked).map(([,name])=>name);
- if(!keyStr) return null;
- const parts=[...active,keyStr].join('+');
- return active.length?'COMBO '+parts:'KEY '+keyStr;
+/* Build COMBO/KEY command from physical key code + accumulated modifiers */
+function buildCmdForCode(code, physMods){
+ const keyName=codeToKeyName(code);
+ if(!keyName) return null;
+ const cbMods=MOD_LIST.filter(([id])=>document.getElementById(id).checked).map(([,n])=>n);
+ const seen=new Set(physMods);
+ const mods=[...physMods,...cbMods.filter(m=>!seen.has(m))];
+ return mods.length?'COMBO '+[...mods,keyName].join('+'):'KEY '+keyName;
 }
 
 function logCombo(cmd){
@@ -102,13 +125,23 @@ function logCombo(cmd){
  comboLog.value=ts+' > '+cmd+'\n'+comboLog.value;
 }
 
+let s_altgr=false;
 document.addEventListener('DOMContentLoaded',()=>{
+ document.addEventListener('keydown',e=>{ if(e.key==='AltGraph') s_altgr=true; });
+ document.addEventListener('keyup',  e=>{ if(e.key==='AltGraph') s_altgr=false; });
  document.getElementById('txt').addEventListener('keydown',function(e){
   if(!document.getElementById('send_immediately').checked) return;
   if(SKIP_KEYS.has(e.key)) return;
   e.preventDefault();
-  const keyStr=normalizeKey(e.key);
-  const cmd=buildCmdForKey(keyStr);
+  /* Detect physical modifiers; AltGr = RALT (on Windows fires as Ctrl+Alt) */
+  const altGr=e.getModifierState('AltGraph')||(e.altKey&&e.ctrlKey);
+  const physMods=[];
+  if(e.shiftKey) physMods.push('LSHIFT');
+  if(e.ctrlKey&&!altGr) physMods.push('LCTRL');
+  if(altGr) physMods.push('RALT');
+  else if(e.altKey) physMods.push('LALT');
+  if(e.metaKey) physMods.push('SUPER');
+  const cmd=buildCmdForCode(e.code,physMods);
   if(!cmd) return;
   fetch('/send',{method:'POST',body:cmd});
   logCombo(cmd);

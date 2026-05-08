@@ -497,6 +497,21 @@ static uint8_t keyname_to_hid(const char *name) {
     if (!strcasecmp(name, "SCROLLLOCK"))             return HID_KEY_SCROLL_LOCK;
     if (!strcasecmp(name, "PAUSE"))                  return HID_KEY_PAUSE;
     if (!strcasecmp(name, "NUMLOCK"))                return HID_KEY_NUM_LOCK;
+    /* Punctuation / physical key positions */
+    if (!strcasecmp(name, "MINUS"))                  return HID_KEY_MINUS;
+    if (!strcasecmp(name, "EQUAL"))                  return HID_KEY_EQUAL;
+    if (!strcasecmp(name, "BRACKETLEFT"))            return HID_KEY_BRACKET_LEFT;
+    if (!strcasecmp(name, "BRACKETRIGHT"))           return HID_KEY_BRACKET_RIGHT;
+    if (!strcasecmp(name, "BACKSLASH"))              return HID_KEY_BACKSLASH;
+    if (!strcasecmp(name, "SEMICOLON"))              return HID_KEY_SEMICOLON;
+    if (!strcasecmp(name, "APOSTROPHE") ||
+        !strcasecmp(name, "QUOTE"))                  return HID_KEY_APOSTROPHE;
+    if (!strcasecmp(name, "GRAVE") ||
+        !strcasecmp(name, "BACKQUOTE"))              return HID_KEY_GRAVE;
+    if (!strcasecmp(name, "COMMA"))                  return HID_KEY_COMMA;
+    if (!strcasecmp(name, "PERIOD"))                 return HID_KEY_PERIOD;
+    if (!strcasecmp(name, "SLASH"))                  return HID_KEY_SLASH;
+    if (!strcasecmp(name, "INTLBACKSLASH"))          return HID_KEY_EUROPE_2;
     /* F1-F12 */
     if ((name[0] == 'F' || name[0] == 'f') && name[1] >= '1' && name[1] <= '9') {
         int fn = atoi(name + 1);
