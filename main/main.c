@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -17,25 +19,82 @@ extern const unsigned char index_html_start[] asm("_binary_index_html_start");
 extern const unsigned char index_html_end[]   asm("_binary_index_html_end");
 extern const unsigned char wifi_html_start[]  asm("_binary_wifi_html_start");
 extern const unsigned char wifi_html_end[]    asm("_binary_wifi_html_end");
+extern const unsigned char usb_html_start[]   asm("_binary_usb_html_start");
+extern const unsigned char usb_html_end[]     asm("_binary_usb_html_end");
 
-#define VERSION "0.0.2a"
+#define VERSION "0.0.2c"
 #define REVISION 0
 
 typedef struct {
     char name[32];
-    char body[256];
+    char body[512];
 } macro_t;
 
-static macro_t macros[10];
+#define MAX_MACROS 20
+#define MACRO_NS   "macros"
+static macro_t macros[MAX_MACROS];
 static bool    hid_enumerated = false;
 static uint8_t hid_led_state  = 0;  /* bits: 0=NumLock 1=CapsLock 2=ScrollLock */
 
 static bool    sta_connected = false;
 static char    sta_ip[16]    = "";
+static bool    s_manual_disconnect  = false; /* set when user explicitly disconnects */
+static int     s_suppress_disc      = 0;     /* suppress events from our own disconnect calls */
+static TaskHandle_t s_wifi_mgr_task = NULL;  /* wifi manager task handle */
+
+/* ---- Macro NVS persistence ---- */
+static void macros_load(void) {
+    nvs_handle_t h;
+    if (nvs_open(MACRO_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t cnt = 0;
+    nvs_get_u8(h, "count", &cnt);
+    if (cnt > MAX_MACROS) cnt = MAX_MACROS;
+    for (int i = 0; i < (int)cnt; i++) {
+        char key[16];
+        size_t len;
+        snprintf(key, sizeof(key), "n%d", i);
+        len = sizeof(macros[i].name);
+        nvs_get_str(h, key, macros[i].name, &len);
+        snprintf(key, sizeof(key), "b%d", i);
+        len = sizeof(macros[i].body);
+        nvs_get_str(h, key, macros[i].body, &len);
+    }
+    nvs_close(h);
+}
+
+/* Save one macro to NVS; returns false if NVS is full */
+static bool macros_save_one(int idx) {
+    nvs_handle_t h;
+    if (nvs_open(MACRO_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    char key[16];
+    bool ok = true;
+    snprintf(key, sizeof(key), "n%d", idx);
+    if (nvs_set_str(h, key, macros[idx].name) != ESP_OK) ok = false;
+    snprintf(key, sizeof(key), "b%d", idx);
+    if (nvs_set_str(h, key, macros[idx].body) != ESP_OK) ok = false;
+    /* Update count if this slot is newly filled */
+    uint8_t cnt = 0; nvs_get_u8(h, "count", &cnt);
+    if (idx >= (int)cnt) { cnt = (uint8_t)(idx + 1); nvs_set_u8(h, "count", cnt); }
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+}
+
+static void macros_delete_one(int idx) {
+    nvs_handle_t h;
+    if (nvs_open(MACRO_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    char key[16];
+    snprintf(key, sizeof(key), "n%d", idx);
+    nvs_erase_key(h, key);
+    snprintf(key, sizeof(key), "b%d", idx);
+    nvs_erase_key(h, key);
+    nvs_commit(h);
+    nvs_close(h);
+}
 
 /* ---- AP config (NVS) ---- */
 #define AP_CFG_NS "ap_cfg"
-static char ap_ssid[33] = "ESP-MACRO";
+static char ap_ssid[33] = "AdminKbd";
 static char ap_pass[65] = "12345678";
 
 static void ap_cfg_load(void) {
@@ -75,9 +134,9 @@ static const uint8_t s_hid_report_descriptor[] = {
 };
 
 /* Mutable USB device identity — overwritten from NVS before USB init */
-static char s_manufacturer[64] = "Espressif";
-static char s_product[64]      = "ESP32-S3 Keyboard";
-static char s_serial[32]       = "ESP-MACRO-001";
+static char s_manufacturer[64] = "Anonymous";
+static char s_product[64]      = "Keyboard";
+static char s_serial[32]       = "lifesim.de-001";
 
 static tusb_desc_device_t s_device_descriptor = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -87,8 +146,8 @@ static tusb_desc_device_t s_device_descriptor = {
     .bDeviceSubClass    = 0,
     .bDeviceProtocol    = 0,
     .bMaxPacketSize0    = 64,
-    .idVendor           = 0x303A,
-    .idProduct          = 0x4004,
+    .idVendor           = 0x16c0,
+    .idProduct          = 0x27db,
     .bcdDevice          = 0x0100,
     .iManufacturer      = 1,
     .iProduct           = 2,
@@ -247,6 +306,7 @@ static void creds_delete(int idx){
     creds_save();
 }
 
+/* Connect to credential idx directly (used for explicit user requests) */
 static void wifi_do_connect(int idx){
     if(idx < 0 || idx >= wifi_cred_count) return;
     wifi_config_t cfg = {};
@@ -254,10 +314,71 @@ static void wifi_do_connect(int idx){
     strncpy((char*)cfg.sta.password, wifi_creds[idx].pass, sizeof(cfg.sta.password)-1);
     sta_connected = false;
     sta_ip[0] = 0;
+    s_manual_disconnect = false;
+    s_suppress_disc++;          /* suppress the disconnect event our call triggers */
     esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
     esp_wifi_connect();
     printf("Connecting to SSID: %s\n", wifi_creds[idx].ssid);
+}
+
+/* Scan visible APs, return credential index with best RSSI; -1 if none match */
+static int wifi_scan_best(void){
+    if(wifi_cred_count == 0) return -1;
+    wifi_scan_config_t sc = {
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 100,
+        .scan_time.active.max = 300,
+    };
+    if(esp_wifi_scan_start(&sc, true) != ESP_OK) return 0; /* fallback */
+
+    uint16_t n = 24;
+    wifi_ap_record_t *aps = malloc(n * sizeof(wifi_ap_record_t));
+    if(!aps) return 0;
+    esp_wifi_scan_get_ap_records(&n, aps);
+
+    int best_cred = -1;
+    int8_t best_rssi = -127;
+    for(int i = 0; i < (int)n; i++){
+        for(int j = 0; j < wifi_cred_count; j++){
+            if(strcmp((char*)aps[i].ssid, wifi_creds[j].ssid) == 0){
+                if(aps[i].rssi > best_rssi){
+                    best_rssi = aps[i].rssi;
+                    best_cred = j;
+                }
+                break;
+            }
+        }
+    }
+    free(aps);
+    if(best_cred >= 0)
+        printf("WiFi scan: best match [%d] %s (%d dBm)\n",
+               best_cred, wifi_creds[best_cred].ssid, (int)best_rssi);
+    else
+        printf("WiFi scan: no known network visible\n");
+    return best_cred;
+}
+
+/* Manager task: scans and connects; retries every 30 s if nothing visible */
+#define WIFI_RETRY_MS 30000
+static void wifi_manager_task(void *arg){
+    (void)arg;
+    for(;;){
+        /* Block until woken by a disconnect event or retry timeout */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(WIFI_RETRY_MS));
+
+        if(s_manual_disconnect || sta_connected || wifi_cred_count == 0) continue;
+
+        vTaskDelay(pdMS_TO_TICKS(1500)); /* let radio settle after disconnect */
+
+        if(sta_connected || s_manual_disconnect) continue;
+
+        int idx = wifi_scan_best();
+        if(idx >= 0){
+            wifi_do_connect(idx);
+        }
+        /* If no match, task sleeps WIFI_RETRY_MS then scans again automatically */
+    }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data){
@@ -269,7 +390,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if(base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED){
         sta_connected = false;
         sta_ip[0] = 0;
-        printf("STA disconnected\n");
+        if(s_suppress_disc > 0){ s_suppress_disc--; return; }
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t*)data;
+        printf("STA disconnected reason=%d\n", d ? (int)d->reason : -1);
+        if(s_manual_disconnect){ s_manual_disconnect = false; return; }
+        /* Wake manager task to scan and reconnect */
+        if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
     }
 }
 
@@ -296,7 +422,10 @@ static void wifi_init_ap(void){
     esp_wifi_start();
 
     creds_load();
-    if(wifi_cred_count > 0) wifi_do_connect(0);
+
+    /* Start WiFi manager task; notify it immediately if we have saved credentials */
+    xTaskCreate(wifi_manager_task, "wifi_mgr", 4096, NULL, 4, &s_wifi_mgr_task);
+    if(wifi_cred_count > 0) xTaskNotifyGive(s_wifi_mgr_task);
 }
 
 /* ---- HID keyboard helpers ---- */
@@ -397,32 +526,48 @@ static uint8_t modname_to_modifier(const char *name) {
     return 0;
 }
 
-static bool hid_wait_ready(void) {
-    for (int i = 0; i < 20 && !tud_hid_ready(); i++) {
+/* Wait for HID endpoint ready, up to timeout_ms */
+static bool hid_wait_ready(int timeout_ms) {
+    for (int i = 0; i < timeout_ms / 5; i++) {
+        if (tud_hid_ready()) return true;
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     return tud_hid_ready();
 }
 
 static void hid_press_key(uint8_t modifier, uint8_t keycode) {
-    if (!hid_wait_ready()) return;
+    /* Key-down: wait up to 200 ms */
+    if (!hid_wait_ready(200)) {
+        printf("[HID] key-down skipped: not ready\n");
+        return;
+    }
     uint8_t keys[6] = {keycode, 0, 0, 0, 0, 0};
     tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, modifier, keys);
-    /* Always send release — wait for endpoint ready again first */
+    vTaskDelay(pdMS_TO_TICKS(15));
+
+    /* Key-up: MUST succeed — retry until tud_hid_keyboard_report returns true */
+    for (int i = 0; i < 60; i++) {
+        if (hid_wait_ready(50)) {
+            if (tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, 0, NULL)) break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
-    hid_wait_ready();
-    tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, 0, NULL);
-    vTaskDelay(pdMS_TO_TICKS(5));
 }
 
 static void hid_consumer_key(uint16_t usage) {
-    if (!hid_wait_ready()) return;
+    if (!hid_wait_ready(200)) return;
     tud_hid_report(HID_REPORT_ID_CONSUMER, (uint8_t *)&usage, 2);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    hid_wait_ready();
+    vTaskDelay(pdMS_TO_TICKS(15));
+    /* Release: retry until it succeeds */
     uint16_t release = 0;
-    tud_hid_report(HID_REPORT_ID_CONSUMER, (uint8_t *)&release, 2);
-    vTaskDelay(pdMS_TO_TICKS(5));
+    for (int i = 0; i < 60; i++) {
+        if (hid_wait_ready(50)) {
+            if (tud_hid_report(HID_REPORT_ID_CONSUMER, (uint8_t *)&release, 2)) break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 static uint16_t medianame_to_usage(const char *name) {
@@ -441,13 +586,36 @@ static uint16_t medianame_to_usage(const char *name) {
     return 0;
 }
 
+/* ---- HID command queue ---- */
+#define HID_CMD_MAX    512
+#define HID_QUEUE_DEPTH 32
+typedef char hid_cmd_t[HID_CMD_MAX];
+static QueueHandle_t s_hid_queue;
+
+/* Enqueue a command string for the HID worker task (callable from any task) */
 static void backend_send(const char *s) {
+    hid_cmd_t cmd;
+    strncpy(cmd, s, HID_CMD_MAX - 1);
+    cmd[HID_CMD_MAX - 1] = 0;
+    if (xQueueSend(s_hid_queue, cmd, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        printf("[HID] queue full, dropped: %.40s\n", s);
+    }
+}
+
+/* Execute one HID command — called only from the HID worker task */
+static void hid_exec(const char *s) {
+    if (strncmp(s, "DELAY ", 6) == 0) {
+        int ms = atoi(s + 6);
+        if (ms > 0 && ms <= 30000) vTaskDelay(pdMS_TO_TICKS(ms));
+        return;
+    }
     if (strncmp(s, "MEDIA ", 6) == 0) {
         uint16_t usage = medianame_to_usage(s + 6);
         if (usage) hid_consumer_key(usage);
         else printf("[HID] Unknown media key: %s\n", s + 6);
         return;
-    } else if (strncmp(s, "KEY ", 4) == 0) {
+    }
+    if (strncmp(s, "KEY ", 4) == 0) {
         uint8_t kc = keyname_to_hid(s + 4);
         if (kc) hid_press_key(0, kc);
         else printf("[HID] Unknown key: %s\n", s + 4);
@@ -485,6 +653,16 @@ static void backend_send(const char *s) {
     }
 }
 
+static void hid_worker_task(void *arg) {
+    (void)arg;
+    hid_cmd_t cmd;
+    for (;;) {
+        if (xQueueReceive(s_hid_queue, cmd, portMAX_DELAY) == pdTRUE) {
+            hid_exec(cmd);
+        }
+    }
+}
+
 static void run_macro_script(const char *script){
     char buf[512];
     strncpy(buf, script, sizeof(buf)-1);
@@ -495,18 +673,28 @@ static void run_macro_script(const char *script){
     while (line) {
         if (strncmp(line, "STRING ", 7) == 0) {
             backend_send(line + 7);
-        } else if (strncmp(line, "KEY ", 4) == 0) {
-            backend_send(line);
-        } else if (strncmp(line, "COMBO ", 6) == 0) {
-            backend_send(line);
-        } else if (strncmp(line, "MEDIA ", 6) == 0) {
-            backend_send(line);
-        } else if (strncmp(line, "DELAY ", 6) == 0) {
-            int ms = atoi(line + 6);
-            vTaskDelay(pdMS_TO_TICKS(ms));
+        } else if (strncmp(line, "KEY ",   4) == 0 ||
+                   strncmp(line, "COMBO ", 6) == 0 ||
+                   strncmp(line, "MEDIA ", 6) == 0 ||
+                   strncmp(line, "DELAY ", 6) == 0) {
+            backend_send(line);  /* HID task handles DELAY too */
         }
         line = strtok_r(NULL, "\n", &saveptr);
     }
+}
+
+/* Receive the complete POST body, returns bytes received (body is NUL-terminated) */
+static int recv_body(httpd_req_t *req, char *buf, size_t buf_size) {
+    int total = 0, remaining = (int)req->content_len;
+    while (remaining > 0 && total < (int)buf_size - 1) {
+        int n = httpd_req_recv(req, buf + total,
+                               (size_t)(remaining < (int)(buf_size - total - 1)
+                                        ? remaining : (int)(buf_size - total - 1)));
+        if (n <= 0) break;
+        total += n; remaining -= n;
+    }
+    buf[total] = 0;
+    return total;
 }
 
 static esp_err_t root_get(httpd_req_t *req){
@@ -518,9 +706,7 @@ static esp_err_t root_get(httpd_req_t *req){
 
 static esp_err_t send_post(httpd_req_t *req){
     char buf[512];
-    int len=httpd_req_recv(req,buf,sizeof(buf)-1);
-    if(len<0) len=0;
-    buf[len]=0;
+    recv_body(req, buf, sizeof(buf));
     backend_send(buf);
     httpd_resp_sendstr(req,"OK");
     return ESP_OK;
@@ -528,9 +714,7 @@ static esp_err_t send_post(httpd_req_t *req){
 
 static esp_err_t macro_save(httpd_req_t *req){
     char buf[512];
-    int len=httpd_req_recv(req,buf,sizeof(buf)-1);
-    if(len<0) len=0;
-    buf[len]=0;
+    recv_body(req, buf, sizeof(buf));
 
     char *sep=strchr(buf,'|');
     if(!sep){ httpd_resp_sendstr(req,"ERR"); return ESP_OK; }
@@ -538,13 +722,14 @@ static esp_err_t macro_save(httpd_req_t *req){
     char *name=buf;
     char *body=sep+1;
 
-    for(int i=0;i<10;i++){
-        if(macros[i].name[0]==0 || strcmp(macros[i].name,name)==0){
-            strncpy(macros[i].name,name,sizeof(macros[i].name)-1);
-            strncpy(macros[i].body,body,sizeof(macros[i].body)-1);
-            break;
-        }
+    int slot = -1;
+    for(int i=0;i<MAX_MACROS;i++){
+        if(macros[i].name[0]==0 || strcmp(macros[i].name,name)==0){ slot=i; break; }
     }
+    if(slot < 0){ httpd_resp_sendstr(req,"ERR:FULL"); return ESP_OK; }
+    strncpy(macros[slot].name, name, sizeof(macros[slot].name)-1);
+    strncpy(macros[slot].body, body, sizeof(macros[slot].body)-1);
+    if(!macros_save_one(slot)){ httpd_resp_sendstr(req,"ERR:NVS"); return ESP_OK; }
     httpd_resp_sendstr(req,"OK");
     return ESP_OK;
 }
@@ -553,7 +738,7 @@ static esp_err_t macro_list(httpd_req_t *req){
     char out[2048];
     strcpy(out,"[");
     int first=1;
-    for(int i=0;i<10;i++){
+    for(int i=0;i<MAX_MACROS;i++){
         if(macros[i].name[0]){
             if(!first) strcat(out,",");
             first=0;
@@ -593,6 +778,7 @@ static esp_err_t wifi_page_get(httpd_req_t *req){
 }
 
 static esp_err_t wifi_disconnect_post(httpd_req_t *req){
+    s_manual_disconnect = true;
     sta_connected = false;
     sta_ip[0] = 0;
     esp_wifi_disconnect();
@@ -658,13 +844,23 @@ static esp_err_t wifi_connect_idx_post(httpd_req_t *req){
 }
 
 static esp_err_t macro_run(httpd_req_t *req){
-    char buf[16];
-    int len=httpd_req_recv(req,buf,sizeof(buf)-1);
-    if(len<0) len=0;
-    buf[len]=0;
+    char buf[8];
+    recv_body(req, buf, sizeof(buf));
     int id=atoi(buf);
-    if(id>=0 && id<10 && macros[id].name[0]){
+    if(id>=0 && id<MAX_MACROS && macros[id].name[0]){
         run_macro_script(macros[id].body);
+    }
+    httpd_resp_sendstr(req,"OK");
+    return ESP_OK;
+}
+
+static esp_err_t macro_delete(httpd_req_t *req){
+    char buf[8];
+    recv_body(req, buf, sizeof(buf));
+    int id=atoi(buf);
+    if(id>=0 && id<MAX_MACROS && macros[id].name[0]){
+        macros_delete_one(id);
+        memset(&macros[id], 0, sizeof(macro_t));
     }
     httpd_resp_sendstr(req,"OK");
     return ESP_OK;
@@ -708,6 +904,13 @@ static esp_err_t wifi_scan_get(httpd_req_t *req){
     return ESP_OK;
 }
 
+static esp_err_t usb_page_get(httpd_req_t *req) {
+    size_t len = usb_html_end - usb_html_start;
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char*)usb_html_start, len);
+    return ESP_OK;
+}
+
 static esp_err_t usb_cfg_get_h(httpd_req_t *req) {
     char out[256];
     snprintf(out, sizeof(out),
@@ -719,12 +922,7 @@ static esp_err_t usb_cfg_get_h(httpd_req_t *req) {
     return ESP_OK;
 }
 
-static esp_err_t usb_cfg_post_h(httpd_req_t *req) {
-    char buf[256];
-    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
-    if (len < 0) len = 0;
-    buf[len] = 0;
-    /* format: VID|PID|manufacturer|product|serial  (VID/PID as hex strings) */
+static void usb_cfg_apply(char *buf) {
     char *sp;
     char *vid_s  = strtok_r(buf,  "|", &sp);
     char *pid_s  = strtok_r(NULL, "|", &sp);
@@ -737,8 +935,22 @@ static esp_err_t usb_cfg_post_h(httpd_req_t *req) {
     if (prod_s) strncpy(s_product,      prod_s,  sizeof(s_product)-1);
     if (ser_s)  strncpy(s_serial,       ser_s,   sizeof(s_serial)-1);
     usb_cfg_save();
+}
+
+static esp_err_t usb_cfg_post_h(httpd_req_t *req) {
+    char buf[256];
+    recv_body(req, buf, sizeof(buf));
+    usb_cfg_apply(buf);
     httpd_resp_sendstr(req, "OK");
     schedule_restart();
+    return ESP_OK;
+}
+
+static esp_err_t usb_cfg_save_h(httpd_req_t *req) {
+    char buf[256];
+    recv_body(req, buf, sizeof(buf));
+    usb_cfg_apply(buf);
+    httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
 
@@ -770,7 +982,7 @@ static esp_err_t ap_cfg_post_h(httpd_req_t *req) {
 static void web_start(void){
     httpd_handle_t server=NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 20;
+    cfg.max_uri_handlers = 26;
     httpd_start(&server,&cfg);
 
     httpd_uri_t u1={.uri="/",.method=HTTP_GET,.handler=root_get};
@@ -778,6 +990,7 @@ static void web_start(void){
     httpd_uri_t u3={.uri="/macro/save",.method=HTTP_POST,.handler=macro_save};
     httpd_uri_t u4={.uri="/macro/list",.method=HTTP_GET,.handler=macro_list};
     httpd_uri_t u5={.uri="/macro/run",.method=HTTP_POST,.handler=macro_run};
+    httpd_uri_t u5b={.uri="/macro/delete",.method=HTTP_POST,.handler=macro_delete};
     httpd_uri_t u6={.uri="/status",.method=HTTP_GET,.handler=status_get};
     httpd_uri_t u7={.uri="/wifi/connect",.method=HTTP_POST,.handler=wifi_connect_post};
     httpd_uri_t u8 ={.uri="/wifi",.method=HTTP_GET,.handler=wifi_page_get};
@@ -786,8 +999,10 @@ static void web_start(void){
     httpd_uri_t u11={.uri="/wifi/delete",.method=HTTP_POST,.handler=wifi_delete_post};
     httpd_uri_t u12={.uri="/wifi/connect_idx",.method=HTTP_POST,.handler=wifi_connect_idx_post};
     httpd_uri_t u13={.uri="/wifi/scan",.method=HTTP_GET,.handler=wifi_scan_get};
+    httpd_uri_t u13b={.uri="/usb",.method=HTTP_GET,.handler=usb_page_get};
     httpd_uri_t u14={.uri="/usb/config",.method=HTTP_GET,.handler=usb_cfg_get_h};
     httpd_uri_t u15={.uri="/usb/config",.method=HTTP_POST,.handler=usb_cfg_post_h};
+    httpd_uri_t u15b={.uri="/usb/config/save",.method=HTTP_POST,.handler=usb_cfg_save_h};
     httpd_uri_t u16={.uri="/ap/config",.method=HTTP_GET,.handler=ap_cfg_get_h};
     httpd_uri_t u17={.uri="/ap/config",.method=HTTP_POST,.handler=ap_cfg_post_h};
 
@@ -796,6 +1011,7 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u3);
     httpd_register_uri_handler(server,&u4);
     httpd_register_uri_handler(server,&u5);
+    httpd_register_uri_handler(server,&u5b);
     httpd_register_uri_handler(server,&u6);
     httpd_register_uri_handler(server,&u7);
     httpd_register_uri_handler(server,&u8);
@@ -804,8 +1020,10 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u11);
     httpd_register_uri_handler(server,&u12);
     httpd_register_uri_handler(server,&u13);
+    httpd_register_uri_handler(server,&u13b);
     httpd_register_uri_handler(server,&u14);
     httpd_register_uri_handler(server,&u15);
+    httpd_register_uri_handler(server,&u15b);
     httpd_register_uri_handler(server,&u16);
     httpd_register_uri_handler(server,&u17);
 }
@@ -829,6 +1047,12 @@ void app_main(void){
     }
     ap_cfg_load();
     usb_cfg_load();
+    macros_load();
+
+    /* Create HID command queue and worker task BEFORE USB init */
+    s_hid_queue = xQueueCreate(HID_QUEUE_DEPTH, sizeof(hid_cmd_t));
+    xTaskCreate(hid_worker_task, "hid_worker", 4096, NULL, 5, NULL);
+
     usb_hid_init();
     wifi_init_ap();
     web_start();

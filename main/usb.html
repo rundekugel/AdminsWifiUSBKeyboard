@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Admin-Keyboard – USB Device</title>
+<style>
+body{font-family:Arial;margin:20px}
+input{width:100%;margin:4px 0;box-sizing:border-box;padding:6px}
+button{margin:4px;padding:8px}
+.card{border:1px solid #ccc;padding:10px;margin:8px 0}
+#msg{margin-top:8px;font-size:0.9em}
+</style>
+</head>
+<body>
+<p><a href="/">&larr; Back</a></p>
+<h2>USB Device Config</h2>
+<div class="card">
+<label>VID (hex, e.g. 16c0)<input id="vid" type="text" placeholder="16c0"></label>
+<label>PID (hex, e.g. 27db)<input id="pid" type="text" placeholder="27db"></label>
+<label>Manufacturer<input id="mfr" type="text" placeholder="Manufacturer"></label>
+<label>Product<input id="product" type="text" placeholder="Product name"></label>
+<label>Serial Number<input id="serial" type="text" placeholder="Serial number"></label>
+<br>
+<button onclick="save(true)">Save &amp; Restart</button>
+<button onclick="save(false)">Save</button>
+<div id="msg"></div>
+</div>
+<script>
+async function load(){
+ try{
+  const j=await (await fetch('/usb/config')).json();
+  document.getElementById('vid').value=(j.vid||'').replace(/^0x/i,'');
+  document.getElementById('pid').value=(j.pid||'').replace(/^0x/i,'');
+  document.getElementById('mfr').value=j.mfr||'';
+  document.getElementById('product').value=j.product||'';
+  document.getElementById('serial').value=j.serial||'';
+ }catch(e){document.getElementById('msg').textContent='Load failed.';}
+}
+async function save(restart){
+ const vid=document.getElementById('vid').value.replace(/^0x/i,'').trim().toUpperCase();
+ const pid=document.getElementById('pid').value.replace(/^0x/i,'').trim().toUpperCase();
+ const mfr=document.getElementById('mfr').value;
+ const product=document.getElementById('product').value;
+ const serial=document.getElementById('serial').value;
+ const msg=document.getElementById('msg');
+ if(!vid||!pid){msg.textContent='VID and PID required.';return;}
+ msg.textContent='Saving\u2026';
+ const url=restart?'/usb/config':'/usb/config/save';
+ await fetch(url,{method:'POST',body:vid+'|'+pid+'|'+mfr+'|'+product+'|'+serial});
+ msg.textContent=restart?'Saved \u2013 restarting\u2026':'Saved.';
+}
+load();
+</script>
+</body>
+</html>

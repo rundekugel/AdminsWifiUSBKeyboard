@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>ESP Macro</title>
+<title>Admin-Keyboard</title>
 <style>
 body{font-family:Arial;margin:20px}
 textarea,input[type=text],input[type=password],input:not([type]){width:100%;margin:4px 0;box-sizing:border-box}
@@ -15,13 +15,13 @@ button{margin:4px;padding:8px}
 .st-dot.on{background:#2a2}
 .st-dot.off{background:#c44}
 #lockStatus{margin:6px 0}
-#lockStatus span{display:inline-block;padding:2px 8px;margin:2px 2px 2px 0;border:1px solid #999;border-radius:3px;font-size:0.8em;font-weight:bold;opacity:0.3;background:#eee}
+#lockStatus span{display:inline-block;padding:2px 8px;margin:2px 2px 2px 0;border:1px solid #999;border-radius:3px;font-size:0.8em;font-weight:bold;opacity:0.3;background:#eee;cursor:pointer}
 #lockStatus span.on{opacity:1;background:#2a2;color:#fff;border-color:#2a2}
 </style>
 </head>
 <body>
-<h2>ESP Macro Console V0.0.2</h2>
-<p><a href="/wifi">&#9881; WiFi Settings</a></p>
+<h2>Admin-Keyboard Console V0.1.0</h2>
+<p><a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a></p>
 <div id="statusBar">
   <span><span class="st-dot" id="dot_hid"></span><strong>USB HID:</strong> <span id="st_hid">…</span></span>
   <span><span class="st-dot" id="dot_wifi"></span><strong>WiFi Clients:</strong> <span id="st_clients">…</span></span>
@@ -41,9 +41,9 @@ button{margin:4px;padding:8px}
 </div>
 <textarea id="txt" rows="4" placeholder="Type here — keys sent immediately when checked, or uncheck and click Send Text"></textarea>
 <div id="lockStatus">
-  <span id="lk_num">NUM</span>
-  <span id="lk_caps">CAPS</span>
-  <span id="lk_scrl">SCRL</span>
+  <span id="lk_num"  onclick="fetch('/send',{method:'POST',body:'KEY NUMLOCK'})">NUM</span>
+  <span id="lk_caps" onclick="fetch('/send',{method:'POST',body:'KEY CAPSLOCK'})">CAPS</span>
+  <span id="lk_scrl" onclick="fetch('/send',{method:'POST',body:'KEY SCROLLLOCK'})">SCRL</span>
 </div>
 <label><input type="checkbox" id="send_immediately" checked> Send keys immediately</label>
 <br>
@@ -64,21 +64,9 @@ button{margin:4px;padding:8px}
 </div>
 
 <div class="card">
-<h3>USB Device Config</h3>
-<label>VID (hex)<input id="usb_vid" type="text" placeholder="e.g. 303A"></label>
-<label>PID (hex)<input id="usb_pid" type="text" placeholder="e.g. 4004"></label>
-<label>Manufacturer<input id="usb_mfr" type="text" placeholder="Manufacturer"></label>
-<label>Product<input id="usb_product" type="text" placeholder="Product name"></label>
-<label>Serial<input id="usb_serial" type="text" placeholder="Serial number"></label>
-<br>
-<button onclick="saveUsbCfg()">Save &amp; Restart</button>
-<span id="usb_msg" style="font-size:0.85em;margin-left:8px"></span>
-</div>
-
-<div class="card">
 <h3>Save Macro</h3>
-<input id="name" placeholder="Macro Name">
-<textarea id="body" rows="8">STRING hello
+<input id="macro_name" placeholder="Macro Name">
+<textarea id="macro_body" rows="8">STRING hello
 KEY ENTER</textarea>
 <button onclick="saveMacro()">Save</button>
 </div>
@@ -161,33 +149,19 @@ async function pollStatus(){
 setInterval(pollStatus,2000);
 pollStatus();
 
-async function loadUsbCfg(){
- try{
-  const j=await (await fetch('/usb/config')).json();
-  document.getElementById('usb_vid').value=j.vid||'';
-  document.getElementById('usb_pid').value=j.pid||'';
-  document.getElementById('usb_mfr').value=j.mfr||'';
-  document.getElementById('usb_product').value=j.product||'';
-  document.getElementById('usb_serial').value=j.serial||'';
- }catch(e){}
-}
-async function saveUsbCfg(){
- const vid=document.getElementById('usb_vid').value.replace(/^0x/i,'').trim();
- const pid=document.getElementById('usb_pid').value.replace(/^0x/i,'').trim();
- const mfr=document.getElementById('usb_mfr').value;
- const product=document.getElementById('usb_product').value;
- const serial=document.getElementById('usb_serial').value;
- document.getElementById('usb_msg').textContent='Saving…';
- await fetch('/usb/config',{method:'POST',body:vid+'|'+pid+'|'+mfr+'|'+product+'|'+serial});
- document.getElementById('usb_msg').textContent='Saved – restarting…';
-}
-
 async function saveMacro(){
- await fetch('/macro/save',{method:'POST',body:name.value+'|'+body.value});
+ const n=document.getElementById('macro_name').value;
+ const b=document.getElementById('macro_body').value;
+ await fetch('/macro/save',{method:'POST',body:n+'|'+b});
  load();
 }
 async function runMacro(id){
  await fetch('/macro/run',{method:'POST',body:''+id});
+}
+async function deleteMacro(id){
+ if(!confirm('Delete macro?')) return;
+ await fetch('/macro/delete',{method:'POST',body:''+id});
+ load();
 }
 async function load(){
  let r=await fetch('/macro/list');
@@ -195,12 +169,14 @@ async function load(){
  list.innerHTML='';
  j.forEach(m=>{
    let d=document.createElement('div');
-   d.innerHTML='<button onclick="runMacro('+m.id+')">Run</button> '+m.name;
+   d.style='display:flex;align-items:center;gap:6px;margin:3px 0';
+   d.innerHTML='<button onclick="runMacro('+m.id+')">Run</button>'+
+     '<span style="flex:1">'+m.name+'</span>'+
+     '<button onclick="deleteMacro('+m.id+')" style="color:#c00;font-size:0.8em">Del</button>';
    list.appendChild(d);
  });
 }
 load();
-loadUsbCfg();
 </script>
 </body>
 </html>
