@@ -20,7 +20,7 @@ button{margin:4px;padding:8px}
 </style>
 </head>
 <body>
-<h2>Admin-Keyboard Console V0.1.0</h2>
+<h2>Admin-Keyboard Console V%%VERSION%%</h2>
 <p><a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/help">&#63; Help</a></p>
 <div id="statusBar">
   <span><span class="st-dot" id="dot_hid"></span><strong>USB HID:</strong> <span id="st_hid">…</span></span>
@@ -31,13 +31,13 @@ button{margin:4px;padding:8px}
 <div class="card">
 <h3>Send</h3>
 <div id="modifiers">
-  <label><input type="checkbox" id="mod_lctrl"> LCtrl</label>
-  <label><input type="checkbox" id="mod_rctrl"> RCtrl</label>
-  <label><input type="checkbox" id="mod_lshift"> LShift</label>
-  <label><input type="checkbox" id="mod_rshift"> RShift</label>
-  <label><input type="checkbox" id="mod_lalt"> LAlt</label>
-  <label><input type="checkbox" id="mod_ralt"> RAlt</label>
-  <label><input type="checkbox" id="mod_super"> Super</label>
+  <label><input type="checkbox" id="mod_lctrl" onchange="updateHoldMods()"> LCtrl</label>
+  <label><input type="checkbox" id="mod_rctrl" onchange="updateHoldMods()"> RCtrl</label>
+  <label><input type="checkbox" id="mod_lshift" onchange="updateHoldMods()"> LShift</label>
+  <label><input type="checkbox" id="mod_rshift" onchange="updateHoldMods()"> RShift</label>
+  <label><input type="checkbox" id="mod_lalt" onchange="updateHoldMods()"> LAlt</label>
+  <label><input type="checkbox" id="mod_ralt" onchange="updateHoldMods()"> RAlt</label>
+  <label><input type="checkbox" id="mod_super" onchange="updateHoldMods()"> Super</label>
 </div>
 <textarea id="txt" rows="4" placeholder="Type here — keys sent immediately when checked, or uncheck and click Send Text"></textarea>
 <div id="lockStatus">
@@ -118,6 +118,13 @@ function buildCmdForCode(code, physMods){
  const seen=new Set(physMods);
  const mods=[...physMods,...cbMods.filter(m=>!seen.has(m))];
  return mods.length?'COMBO '+[...mods,keyName].join('+'):'KEY '+keyName;
+}
+
+function updateHoldMods(){
+ const mods=MOD_LIST.filter(([id])=>document.getElementById(id).checked).map(([,n])=>n);
+ const cmd=mods.length?'HOLDMOD '+mods.join('+'):'HOLDMOD';
+ fetch('/send',{method:'POST',body:cmd});
+ logCombo(cmd);
 }
 
 function logCombo(cmd){

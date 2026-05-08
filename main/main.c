@@ -26,7 +26,7 @@ extern const unsigned char usb_html_end[]     asm("_binary_usb_html_end");
 extern const unsigned char help_html_start[]  asm("_binary_help_html_start");
 extern const unsigned char help_html_end[]    asm("_binary_help_html_end");
 
-#define VERSION "0.0.2c"
+#define VERSION "0.4.0"
 #define REVISION 0
 
 typedef struct {
@@ -694,6 +694,9 @@ static bool hid_wait_ready(int timeout_ms) {
     return tud_hid_ready();
 }
 
+/* Modifiers held persistently (set via HOLDMOD command from UI) */
+static uint8_t g_held_mods = 0;
+
 static void hid_press_key(uint8_t modifier, uint8_t keycode) {
     /* Key-down: wait up to 200 ms */
     if (!hid_wait_ready(200)) {
@@ -702,13 +705,13 @@ static void hid_press_key(uint8_t modifier, uint8_t keycode) {
     }
     led_key_invert(true);
     uint8_t keys[6] = {keycode, 0, 0, 0, 0, 0};
-    tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, modifier, keys);
+    tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, modifier | g_held_mods, keys);
     vTaskDelay(pdMS_TO_TICKS(15));
 
-    /* Key-up: MUST succeed — retry until tud_hid_keyboard_report returns true */
+    /* Key-up: restore held mods (not full release) so sticky mods stay active */
     for (int i = 0; i < 60; i++) {
         if (hid_wait_ready(50)) {
-            if (tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, 0, NULL)) break;
+            if (tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, g_held_mods, NULL)) break;
         }
         vTaskDelay(pdMS_TO_TICKS(5));
     }
@@ -776,6 +779,21 @@ static void hid_exec(const char *s) {
         uint16_t usage = medianame_to_usage(s + 6);
         if (usage) hid_consumer_key(usage);
         else printf("[HID] Unknown media key: %s\n", s + 6);
+        return;
+    }
+    if (strncmp(s, "HOLDMOD", 7) == 0) {
+        uint8_t mods = 0;
+        if (s[7] == ' ' && s[8]) {
+            char tmp[64];
+            strncpy(tmp, s + 8, sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = 0;
+            char *save, *tok = strtok_r(tmp, "+", &save);
+            while (tok) { mods |= modname_to_modifier(tok); tok = strtok_r(NULL, "+", &save); }
+        }
+        g_held_mods = mods;
+        uint8_t empty[6] = {0};
+        if (hid_wait_ready(200))
+            tud_hid_keyboard_report(HID_REPORT_ID_KEYBOARD, g_held_mods, empty);
         return;
     }
     if (strncmp(s, "KEY ", 4) == 0) {
@@ -860,11 +878,32 @@ static int recv_body(httpd_req_t *req, char *buf, size_t buf_size) {
     return total;
 }
 
-static esp_err_t root_get(httpd_req_t *req){
-    size_t len = index_html_end - index_html_start;
-    httpd_resp_set_type(req,"text/html");
-    httpd_resp_send(req,(const char*)index_html_start,len);
+/* Send an HTML file, substituting %%VERSION%% with the VERSION string */
+static esp_err_t send_html_versioned(httpd_req_t *req, const uint8_t *start, const uint8_t *end) {
+    size_t src_len = end - start;
+    char *buf = malloc(src_len + 1);
+    if (!buf) { httpd_resp_send_500(req); return ESP_FAIL; }
+    memcpy(buf, start, src_len);
+    buf[src_len] = 0;
+
+    const char *ph = "%%VERSION%%";
+    const size_t ph_len = strlen(ph);
+    const char *ver = VERSION;
+    const size_t ver_len = strlen(ver);
+    char *p;
+    while ((p = strstr(buf, ph)) != NULL) {
+        memmove(p + ver_len, p + ph_len, strlen(p + ph_len) + 1);
+        memcpy(p, ver, ver_len);
+    }
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, buf, strlen(buf));
+    free(buf);
     return ESP_OK;
+}
+
+static esp_err_t root_get(httpd_req_t *req){
+    return send_html_versioned(req, index_html_start, index_html_end);
 }
 
 static esp_err_t send_post(httpd_req_t *req){
@@ -934,10 +973,7 @@ static esp_err_t status_get(httpd_req_t *req){
 }
 
 static esp_err_t wifi_page_get(httpd_req_t *req){
-    size_t len = wifi_html_end - wifi_html_start;
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, (const char*)wifi_html_start, len);
-    return ESP_OK;
+    return send_html_versioned(req, wifi_html_start, wifi_html_end);
 }
 
 static esp_err_t wifi_disconnect_post(httpd_req_t *req){
@@ -1068,17 +1104,11 @@ static esp_err_t wifi_scan_get(httpd_req_t *req){
 }
 
 static esp_err_t help_page_get(httpd_req_t *req) {
-    size_t len = help_html_end - help_html_start;
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, (const char*)help_html_start, len);
-    return ESP_OK;
+    return send_html_versioned(req, help_html_start, help_html_end);
 }
 
 static esp_err_t usb_page_get(httpd_req_t *req) {
-    size_t len = usb_html_end - usb_html_start;
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, (const char*)usb_html_start, len);
-    return ESP_OK;
+    return send_html_versioned(req, usb_html_start, usb_html_end);
 }
 
 static esp_err_t usb_cfg_get_h(httpd_req_t *req) {
