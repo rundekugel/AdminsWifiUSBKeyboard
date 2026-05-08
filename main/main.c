@@ -12,6 +12,7 @@
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
+#include "driver/rmt_tx.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "class/hid/hid_device.h"
@@ -22,6 +23,8 @@ extern const unsigned char wifi_html_start[]  asm("_binary_wifi_html_start");
 extern const unsigned char wifi_html_end[]    asm("_binary_wifi_html_end");
 extern const unsigned char usb_html_start[]   asm("_binary_usb_html_start");
 extern const unsigned char usb_html_end[]     asm("_binary_usb_html_end");
+extern const unsigned char help_html_start[]  asm("_binary_help_html_start");
+extern const unsigned char help_html_end[]    asm("_binary_help_html_end");
 
 #define VERSION "0.0.2c"
 #define REVISION 0
@@ -45,7 +48,8 @@ static TaskHandle_t s_wifi_mgr_task = NULL;  /* wifi manager task handle */
 
 /* ---- LED status indicator ---- */
 #define LED_PIN_DEFAULT (-1)   /* -1 = disabled; configure via USB page */
-static int s_led_pin = LED_PIN_DEFAULT;
+static int  s_led_pin      = LED_PIN_DEFAULT;
+static bool s_led_neopixel = false;
 static volatile int s_led_logical = 0;  /* last written logical level */
 
 #define LED_CMD_BOOT      0   /* 2 Hz blink while booting */
@@ -55,9 +59,51 @@ static volatile int s_led_logical = 0;  /* last written logical level */
 
 static QueueHandle_t s_led_queue;
 
+/* ---- NeoPixel (WS2812) via RMT ---- */
+#define NEO_RES_HZ 10000000  /* 10 MHz → 0.1 µs per tick */
+
+static rmt_channel_handle_t s_neo_chan    = NULL;
+static rmt_encoder_handle_t s_neo_encoder = NULL;
+static uint8_t s_neo_rgb[3] = {0, 0, 0};  /* current "on" color */
+
+static const rmt_symbol_word_t s_neo_zero  = { .level0=1,.duration0=3, .level1=0,.duration1=9 };
+static const rmt_symbol_word_t s_neo_one   = { .level0=1,.duration0=9, .level1=0,.duration1=3 };
+static const rmt_symbol_word_t s_neo_reset = { .level0=0,.duration0=250,.level1=0,.duration1=250 };
+
+static size_t neo_encoder_cb(const void *data, size_t data_size,
+                              size_t symbols_written, size_t symbols_free,
+                              rmt_symbol_word_t *symbols, bool *done, void *arg)
+{
+    (void)arg;
+    if (symbols_free < 8) return 0;
+    size_t pos = symbols_written / 8;
+    const uint8_t *bytes = (const uint8_t *)data;
+    if (pos < data_size) {
+        size_t n = 0;
+        for (int bit = 0x80; bit; bit >>= 1)
+            symbols[n++] = (bytes[pos] & bit) ? s_neo_one : s_neo_zero;
+        return n;
+    }
+    symbols[0] = s_neo_reset;
+    *done = true;
+    return 1;
+}
+
+static void neo_write(uint8_t r, uint8_t g, uint8_t b) {
+    if (!s_neo_chan || !s_neo_encoder) return;
+    uint8_t grb[3] = {g, r, b};  /* WS2812 wants GRB order */
+    rmt_transmit_config_t tx_cfg = {.loop_count = 0};
+    rmt_transmit(s_neo_chan, s_neo_encoder, grb, sizeof(grb), &tx_cfg);
+    rmt_tx_wait_all_done(s_neo_chan, pdMS_TO_TICKS(100));
+}
+
 static void led_write(int v) {
     s_led_logical = v;
-    if (s_led_pin >= 0) gpio_set_level(s_led_pin, v);
+    if (s_led_neopixel) {
+        neo_write(v ? s_neo_rgb[0] : 0, v ? s_neo_rgb[1] : 0, v ? s_neo_rgb[2] : 0);
+    } else if (s_led_pin >= 0) {
+        gpio_set_level(s_led_pin, v);
+    }
 }
 
 static void led_cmd(uint8_t c) {
@@ -66,13 +112,34 @@ static void led_cmd(uint8_t c) {
 
 /* Invert LED output around key-down without changing the logical state */
 static void led_key_invert(bool inv) {
-    if (s_led_pin >= 0)
+    if (s_led_neopixel) {
+        if (inv) {
+            neo_write(32, 0, 0);  /* red flash during keypress */
+        } else {
+            neo_write(s_led_logical ? s_neo_rgb[0] : 0,
+                      s_led_logical ? s_neo_rgb[1] : 0,
+                      s_led_logical ? s_neo_rgb[2] : 0);
+        }
+    } else if (s_led_pin >= 0) {
         gpio_set_level(s_led_pin, inv ? !s_led_logical : s_led_logical);
+    }
 }
 
 static void led_task(void *arg) {
     (void)arg;
-    if (s_led_pin >= 0) {
+    if (s_led_neopixel && s_led_pin >= 0) {
+        rmt_tx_channel_config_t tx_cfg = {
+            .clk_src          = RMT_CLK_SRC_DEFAULT,
+            .gpio_num         = s_led_pin,
+            .mem_block_symbols = 64,
+            .resolution_hz    = NEO_RES_HZ,
+            .trans_queue_depth = 4,
+        };
+        rmt_new_tx_channel(&tx_cfg, &s_neo_chan);
+        rmt_simple_encoder_config_t enc_cfg = { .callback = neo_encoder_cb };
+        rmt_new_simple_encoder(&enc_cfg, &s_neo_encoder);
+        rmt_enable(s_neo_chan);
+    } else if (!s_led_neopixel && s_led_pin >= 0) {
         gpio_config_t io = {
             .pin_bit_mask = 1ULL << s_led_pin,
             .mode = GPIO_MODE_OUTPUT,
@@ -86,8 +153,11 @@ static void led_task(void *arg) {
         TickType_t timeout = (mode == LED_CMD_BOOT) ? pdMS_TO_TICKS(250) : portMAX_DELAY;
         if (xQueueReceive(s_led_queue, &cmd, timeout) == pdTRUE) {
             if (cmd == LED_CMD_FLASH) {
+                uint8_t sr = s_neo_rgb[0], sg = s_neo_rgb[1], sb = s_neo_rgb[2];
+                s_neo_rgb[0] = 32; s_neo_rgb[1] = 32; s_neo_rgb[2] = 0; /* yellow */
                 led_write(1);
                 vTaskDelay(pdMS_TO_TICKS(700));
+                s_neo_rgb[0] = sr; s_neo_rgb[1] = sg; s_neo_rgb[2] = sb;
                 led_write(mode == LED_CMD_CONNECTED ? 1 : 0);
                 continue;
             }
@@ -95,9 +165,14 @@ static void led_task(void *arg) {
             blink = 0;
         }
         switch (mode) {
-            case LED_CMD_BOOT:      blink ^= 1; led_write(blink); break;
-            case LED_CMD_IDLE:      led_write(0); break;
-            case LED_CMD_CONNECTED: led_write(1); break;
+            case LED_CMD_BOOT:
+                s_neo_rgb[0] = 0; s_neo_rgb[1] = 0; s_neo_rgb[2] = 32; /* blue */
+                blink ^= 1; led_write(blink); break;
+            case LED_CMD_IDLE:
+                led_write(0); break;
+            case LED_CMD_CONNECTED:
+                s_neo_rgb[0] = 0; s_neo_rgb[1] = 32; s_neo_rgb[2] = 0; /* green */
+                led_write(1); break;
         }
     }
 }
@@ -246,6 +321,8 @@ static void usb_cfg_load(void) {
     if (nvs_get_u16(h, "pid", &pid) == ESP_OK) s_device_descriptor.idProduct = pid;
     int8_t lp = LED_PIN_DEFAULT;
     if (nvs_get_i8(h, "led_pin", &lp) == ESP_OK) s_led_pin = lp;
+    uint8_t neo = 0;
+    if (nvs_get_u8(h, "led_neo", &neo) == ESP_OK) s_led_neopixel = (neo != 0);
     nvs_close(h);
 }
 
@@ -258,6 +335,7 @@ static void usb_cfg_save(void) {
     nvs_set_u16(h, "vid",     s_device_descriptor.idVendor);
     nvs_set_u16(h, "pid",     s_device_descriptor.idProduct);
     nvs_set_i8 (h, "led_pin", (int8_t)s_led_pin);
+    nvs_set_u8 (h, "led_neo", s_led_neopixel ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -989,6 +1067,13 @@ static esp_err_t wifi_scan_get(httpd_req_t *req){
     return ESP_OK;
 }
 
+static esp_err_t help_page_get(httpd_req_t *req) {
+    size_t len = help_html_end - help_html_start;
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char*)help_html_start, len);
+    return ESP_OK;
+}
+
 static esp_err_t usb_page_get(httpd_req_t *req) {
     size_t len = usb_html_end - usb_html_start;
     httpd_resp_set_type(req, "text/html");
@@ -997,11 +1082,11 @@ static esp_err_t usb_page_get(httpd_req_t *req) {
 }
 
 static esp_err_t usb_cfg_get_h(httpd_req_t *req) {
-    char out[280];
+    char out[300];
     snprintf(out, sizeof(out),
-             "{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\",\"led_pin\":%d}",
+             "{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\",\"led_pin\":%d,\"led_neo\":%d}",
              s_device_descriptor.idVendor, s_device_descriptor.idProduct,
-             s_manufacturer, s_product, s_serial, s_led_pin);
+             s_manufacturer, s_product, s_serial, s_led_pin, s_led_neopixel ? 1 : 0);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
@@ -1015,12 +1100,14 @@ static void usb_cfg_apply(char *buf) {
     char *prod_s = strtok_r(NULL, "|", &sp);
     char *ser_s  = strtok_r(NULL, "|", &sp);
     char *led_s  = strtok_r(NULL, "|", &sp);
+    char *neo_s  = strtok_r(NULL, "|", &sp);
     if (vid_s)  s_device_descriptor.idVendor  = (uint16_t)strtol(vid_s, NULL, 16);
     if (pid_s)  s_device_descriptor.idProduct = (uint16_t)strtol(pid_s, NULL, 16);
     if (mfr_s)  strncpy(s_manufacturer, mfr_s,  sizeof(s_manufacturer)-1);
     if (prod_s) strncpy(s_product,      prod_s,  sizeof(s_product)-1);
     if (ser_s)  strncpy(s_serial,       ser_s,   sizeof(s_serial)-1);
-    if (led_s)  s_led_pin = atoi(led_s);
+    if (led_s)  s_led_pin      = atoi(led_s);
+    if (neo_s)  s_led_neopixel = (atoi(neo_s) != 0);
     usb_cfg_save();
 }
 
@@ -1092,6 +1179,7 @@ static void web_start(void){
     httpd_uri_t u15b={.uri="/usb/config/save",.method=HTTP_POST,.handler=usb_cfg_save_h};
     httpd_uri_t u16={.uri="/ap/config",.method=HTTP_GET,.handler=ap_cfg_get_h};
     httpd_uri_t u17={.uri="/ap/config",.method=HTTP_POST,.handler=ap_cfg_post_h};
+    httpd_uri_t u18={.uri="/help",.method=HTTP_GET,.handler=help_page_get};
 
     httpd_register_uri_handler(server,&u1);
     httpd_register_uri_handler(server,&u2);
@@ -1113,6 +1201,7 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u15b);
     httpd_register_uri_handler(server,&u16);
     httpd_register_uri_handler(server,&u17);
+    httpd_register_uri_handler(server,&u18);
 }
 
 static void usb_hid_init(void) {
