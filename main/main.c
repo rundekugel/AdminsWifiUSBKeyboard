@@ -816,6 +816,8 @@ static uint16_t medianame_to_usage(const char *name) {
         return HID_USAGE_CONSUMER_VOLUME_DECREMENT;
     if (!strcasecmp(name, "MUTE"))
         return HID_USAGE_CONSUMER_MUTE;
+    if (!strcasecmp(name, "STOP"))
+        return HID_USAGE_CONSUMER_STOP;
     return 0;
 }
 
