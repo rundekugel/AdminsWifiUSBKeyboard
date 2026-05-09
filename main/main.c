@@ -26,7 +26,7 @@ extern const unsigned char usb_html_end[]     asm("_binary_usb_html_end");
 extern const unsigned char help_html_start[]  asm("_binary_help_html_start");
 extern const unsigned char help_html_end[]    asm("_binary_help_html_end");
 
-#define VERSION "0.4.1"
+#define VERSION "0.4.2"
 #define REVISION 0
 
 typedef struct {
@@ -362,12 +362,30 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
 
 static void usb_event_cb(tinyusb_event_t *event, void *arg) {
     (void)arg;
-    if (event->id == TINYUSB_EVENT_ATTACHED) {
-        hid_enumerated = true;
-        printf("USB HID mounted\n");
-    } else if (event->id == TINYUSB_EVENT_DETACHED) {
-        hid_enumerated = false;
-        printf("USB HID unmounted\n");
+    switch (event->id) {
+        case TINYUSB_EVENT_ATTACHED:
+            hid_enumerated = true;
+            printf("USB HID mounted\n");
+            break;
+        case TINYUSB_EVENT_DETACHED:
+            hid_enumerated = false;
+            printf("USB HID unmounted\n");
+            break;
+#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK
+        case TINYUSB_EVENT_SUSPENDED:
+            /* Physical cable removal fires SUSPENDED, not DETACHED */
+            hid_enumerated = false;
+            printf("USB HID suspended (disconnected)\n");
+            break;
+#endif
+#ifdef CONFIG_TINYUSB_RESUME_CALLBACK
+        case TINYUSB_EVENT_RESUMED:
+            hid_enumerated = tud_mounted();
+            printf("USB HID resumed\n");
+            break;
+#endif
+        default:
+            break;
     }
 }
 

@@ -17,11 +17,13 @@ button{margin:4px;padding:8px}
 #lockStatus{margin:6px 0}
 #lockStatus span{display:inline-block;padding:2px 8px;margin:2px 2px 2px 0;border:1px solid #999;border-radius:3px;font-size:0.8em;font-weight:bold;opacity:0.3;background:#eee;cursor:pointer}
 #lockStatus span.on{opacity:1;background:#2a2;color:#fff;border-color:#2a2}
+#usbBanner{display:none;background:#c44;color:#fff;padding:8px 12px;border-radius:4px;margin-bottom:8px;font-weight:bold}
 </style>
 </head>
 <body>
 <h2>Admin-Keyboard Console V%%VERSION%%</h2>
 <p><a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/help">&#63; Help</a></p>
+<div id="usbBanner">&#9888; USB HID not connected — keystrokes will not be sent</div>
 <div id="statusBar">
   <span><span class="st-dot" id="dot_hid"></span><strong>USB HID:</strong> <span id="st_hid">…</span></span>
   <span><span class="st-dot" id="dot_wifi"></span><strong>WiFi Clients:</strong> <span id="st_clients">…</span></span>
@@ -52,7 +54,7 @@ button{margin:4px;padding:8px}
 <hr>
 <div><strong>Media:</strong>
  <button onclick="sendMedia('PLAY_PAUSE')">&#9654;&#9646;&#9646;</button>
- <button onclick="sendMedia('STOP')">&#9646;&#9646;</button>
+ <button onclick="sendMedia('STOP')">&#9632;</button>
  <button onclick="sendMedia('PREV')">&#9664;&#9664;</button>
  <button onclick="sendMedia('NEXT')">&#9654;&#9654;</button>
  <button onclick="sendMedia('MUTE')">&#128263;</button>
@@ -198,6 +200,7 @@ async function pollStatus(){
   const j=await r.json();
   document.getElementById('st_hid').textContent=j.hid?'Enumerated':'Not connected';
   document.getElementById('dot_hid').className='st-dot '+(j.hid?'on':'off');
+  document.getElementById('usbBanner').style.display=j.hid?'none':'block';
   document.getElementById('st_clients').textContent=j.clients;
   document.getElementById('dot_wifi').className='st-dot '+(j.clients>0?'on':'off');
   document.getElementById('st_sta').textContent=j.sta?(j.ip||'connected'):'Not connected';
