@@ -26,7 +26,7 @@ extern const unsigned char usb_html_end[]     asm("_binary_usb_html_end");
 extern const unsigned char help_html_start[]  asm("_binary_help_html_start");
 extern const unsigned char help_html_end[]    asm("_binary_help_html_end");
 
-#define VERSION "0.4.0"
+#define VERSION "0.4.1"
 #define REVISION 0
 
 typedef struct {
@@ -40,13 +40,14 @@ static macro_t macros[MAX_MACROS];
 static bool    hid_enumerated = false;
 static uint8_t hid_led_state  = 0;  /* bits: 0=NumLock 1=CapsLock 2=ScrollLock */
 
-static bool    sta_connected = false;
-static char    sta_ip[16]    = "";
-static bool    s_manual_disconnect  = false; /* set when user explicitly disconnects */
-static int     s_suppress_disc      = 0;     /* suppress events from our own disconnect calls */
-static TaskHandle_t s_wifi_mgr_task = NULL;  /* wifi manager task handle */
-static volatile bool s_scanning     = false; /* non-blocking scan in progress */
-static volatile bool s_scan_done    = false; /* SCAN_DONE received, results ready */
+static bool    sta_connected   = false;
+static bool    s_sta_connecting = false; /* esp_wifi_connect() called, not yet got IP */
+static char    sta_ip[16]      = "";
+static bool    s_manual_disconnect = false;
+static int     s_suppress_disc     = 0;
+static TaskHandle_t s_wifi_mgr_task = NULL;
+static volatile bool s_scanning  = false;
+static volatile bool s_scan_done = false;
 
 /* ---- LED status indicator ---- */
 #define LED_PIN_DEFAULT (-1)   /* -1 = disabled; configure via USB page */
@@ -465,13 +466,22 @@ static void wifi_do_connect(int idx){
     wifi_config_t cfg = {};
     strncpy((char*)cfg.sta.ssid,     wifi_creds[idx].ssid, sizeof(cfg.sta.ssid)-1);
     strncpy((char*)cfg.sta.password, wifi_creds[idx].pass, sizeof(cfg.sta.password)-1);
-    sta_connected = false;
-    sta_ip[0] = 0;
+    /* Only call esp_wifi_disconnect() — which fires WIFI_EVENT_STA_DISCONNECTED —
+       when we are actually connected or mid-connection.  Calling it from INIT state
+       (e.g. right after a scan, or after an auth failure) does NOT fire the event,
+       so s_suppress_disc would be left at 1 and the *next* real DISCONNECTED
+       (e.g. another auth failure) would be silently swallowed, stalling reconnect
+       for the full WIFI_RETRY_MS. */
+    if(sta_connected || s_sta_connecting){
+        s_suppress_disc++;
+        esp_wifi_disconnect();
+    }
+    sta_connected    = false;
+    s_sta_connecting = true;
+    sta_ip[0]        = 0;
     s_manual_disconnect = false;
-    s_suppress_disc++;          /* suppress the disconnect event our call triggers */
-    esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
-    led_cmd(LED_CMD_FLASH);     /* 0.7 s flash per connect attempt */
+    led_cmd(LED_CMD_FLASH);
     esp_wifi_connect();
     printf("Connecting to SSID: %s\n", wifi_creds[idx].ssid);
 }
@@ -555,7 +565,7 @@ static void wifi_manager_task(void *arg){
             continue;
         }
 
-        if(sta_connected){ first=false; continue; }
+        if(sta_connected || s_sta_connecting){ first=false; continue; }
 
         /* On reconnect (not first boot) let the radio settle after disconnect */
         if(!first) vTaskDelay(pdMS_TO_TICKS(1500));
@@ -579,7 +589,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     if(base == IP_EVENT && id == IP_EVENT_STA_GOT_IP){
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         esp_ip4addr_ntoa(&ev->ip_info.ip, sta_ip, sizeof(sta_ip));
-        sta_connected = true;
+        s_sta_connecting = false;
+        sta_connected    = true;
         led_cmd(LED_CMD_CONNECTED);
         printf("STA connected, IP: %s\n", sta_ip);
     } else if(base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE){
@@ -587,14 +598,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_scan_done = true;
         if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
     } else if(base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED){
-        sta_connected = false;
+        sta_connected    = false;
+        s_sta_connecting = false;
         sta_ip[0] = 0;
         if(s_suppress_disc > 0){ s_suppress_disc--; return; }
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t*)data;
         printf("STA disconnected reason=%d\n", d ? (int)d->reason : -1);
         if(s_manual_disconnect){ s_manual_disconnect = false; led_cmd(LED_CMD_IDLE); return; }
         led_cmd(LED_CMD_IDLE);
-        /* Wake manager task to scan and reconnect */
         if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
     }
 }
