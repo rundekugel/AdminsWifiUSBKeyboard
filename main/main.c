@@ -45,6 +45,8 @@ static char    sta_ip[16]    = "";
 static bool    s_manual_disconnect  = false; /* set when user explicitly disconnects */
 static int     s_suppress_disc      = 0;     /* suppress events from our own disconnect calls */
 static TaskHandle_t s_wifi_mgr_task = NULL;  /* wifi manager task handle */
+static volatile bool s_scanning     = false; /* non-blocking scan in progress */
+static volatile bool s_scan_done    = false; /* SCAN_DONE received, results ready */
 
 /* ---- LED status indicator ---- */
 #define LED_PIN_DEFAULT (-1)   /* -1 = disabled; configure via USB page */
@@ -447,6 +449,16 @@ static void creds_delete(int idx){
     creds_save();
 }
 
+/* Move credential at idx up (-1) or down (+1) in priority order */
+static void creds_move(int idx, int dir){
+    int tgt = idx + dir;
+    if(tgt < 0 || tgt >= wifi_cred_count) return;
+    wifi_cred_t tmp = wifi_creds[idx];
+    wifi_creds[idx] = wifi_creds[tgt];
+    wifi_creds[tgt] = tmp;
+    creds_save();
+}
+
 /* Connect to credential idx directly (used for explicit user requests) */
 static void wifi_do_connect(int idx){
     if(idx < 0 || idx >= wifi_cred_count) return;
@@ -465,18 +477,15 @@ static void wifi_do_connect(int idx){
 }
 
 /* Scan visible APs, return credential index with best RSSI; -1 if none match */
-static int wifi_scan_best(void){
+/* Read scan results already collected by the driver and pick the best known credential.
+   Priority (list index) breaks ties: lower index wins when RSSI is within 5 dBm. */
+static int wifi_pick_best_from_scan(void){
     if(wifi_cred_count == 0) return -1;
-    wifi_scan_config_t sc = {
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
-    };
-    if(esp_wifi_scan_start(&sc, true) != ESP_OK) return 0; /* fallback */
-
     uint16_t n = 24;
     wifi_ap_record_t *aps = malloc(n * sizeof(wifi_ap_record_t));
     if(!aps) return 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if(n > 24) n = 24;
     esp_wifi_scan_get_ap_records(&n, aps);
 
     int best_cred = -1;
@@ -484,7 +493,10 @@ static int wifi_scan_best(void){
     for(int i = 0; i < (int)n; i++){
         for(int j = 0; j < wifi_cred_count; j++){
             if(strcmp((char*)aps[i].ssid, wifi_creds[j].ssid) == 0){
-                if(aps[i].rssi > best_rssi){
+                /* prefer higher RSSI; if within 5 dBm prefer lower index (higher priority) */
+                if(aps[i].rssi > best_rssi + 5 ||
+                   (aps[i].rssi >= best_rssi - 5 && j < best_cred) ||
+                   best_cred < 0){
                     best_rssi = aps[i].rssi;
                     best_cred = j;
                 }
@@ -494,32 +506,72 @@ static int wifi_scan_best(void){
     }
     free(aps);
     if(best_cred >= 0)
-        printf("WiFi scan: best match [%d] %s (%d dBm)\n",
+        printf("WiFi scan: best [%d] %s (%d dBm)\n",
                best_cred, wifi_creds[best_cred].ssid, (int)best_rssi);
     else
         printf("WiFi scan: no known network visible\n");
     return best_cred;
 }
 
+static void wifi_scan_start_async(void){
+    wifi_scan_config_t sc = {
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 100,
+        .scan_time.active.max = 300,
+    };
+    s_scanning = true;
+    s_scan_done = false;
+    if(esp_wifi_scan_start(&sc, false) != ESP_OK) s_scanning = false;
+}
+
 /* Manager task: scans and connects; retries every 30 s if nothing visible */
-#define WIFI_RETRY_MS 30000
+#define WIFI_RETRY_MS     30000
+#define WIFI_SCAN_TIMEOUT  5000  /* if SCAN_DONE doesn't arrive, give up and connect directly */
 static void wifi_manager_task(void *arg){
     (void)arg;
+    bool first = true;
     for(;;){
-        /* Block until woken by a disconnect event or retry timeout */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(WIFI_RETRY_MS));
+        /* Use a short timeout while a scan is in flight so a missed SCAN_DONE
+           doesn't stall reconnect for the full 30 s retry interval */
+        uint32_t block_ms = s_scanning ? WIFI_SCAN_TIMEOUT : WIFI_RETRY_MS;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(block_ms));
 
-        if(s_manual_disconnect || sta_connected || wifi_cred_count == 0) continue;
+        if(s_manual_disconnect || wifi_cred_count == 0){ first=false; s_scan_done=false; s_scanning=false; continue; }
 
-        vTaskDelay(pdMS_TO_TICKS(1500)); /* let radio settle after disconnect */
+        /* Scan timed out without SCAN_DONE — clear flag and fall through to direct connect */
+        if(s_scanning && !s_scan_done){
+            s_scanning = false;
+            printf("WiFi scan timeout, connecting directly\n");
+        }
 
+        /* Woken by SCAN_DONE: pick best credential from results and connect */
+        if(s_scan_done){
+            s_scan_done = false;
+            if(!sta_connected && !s_manual_disconnect){
+                int idx = wifi_pick_best_from_scan();
+                if(idx >= 0) wifi_do_connect(idx);
+            }
+            first = false;
+            continue;
+        }
+
+        if(sta_connected){ first=false; continue; }
+
+        /* On reconnect (not first boot) let the radio settle after disconnect */
+        if(!first) vTaskDelay(pdMS_TO_TICKS(1500));
+        first = false;
         if(sta_connected || s_manual_disconnect) continue;
 
-        int idx = wifi_scan_best();
-        if(idx >= 0){
-            wifi_do_connect(idx);
+        if(wifi_cred_count == 1){
+            /* Only one network saved — connect directly, no scan needed */
+            wifi_do_connect(0);
+        } else {
+            /* Multiple networks: scan first to find the strongest known AP,
+               then connect to it. Scan runs async; manager sleeps until SCAN_DONE.
+               If scan fails to start, connect directly to highest-priority credential. */
+            wifi_scan_start_async();
+            if(!s_scanning) wifi_do_connect(0);
         }
-        /* If no match, task sleeps WIFI_RETRY_MS then scans again automatically */
     }
 }
 
@@ -530,6 +582,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         sta_connected = true;
         led_cmd(LED_CMD_CONNECTED);
         printf("STA connected, IP: %s\n", sta_ip);
+    } else if(base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE){
+        s_scanning = false;
+        s_scan_done = true;
+        if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
     } else if(base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED){
         sta_connected = false;
         sta_ip[0] = 0;
@@ -1042,6 +1098,18 @@ static esp_err_t wifi_connect_idx_post(httpd_req_t *req){
     return ESP_OK;
 }
 
+static esp_err_t wifi_move_post(httpd_req_t *req){
+    char buf[16];
+    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
+    if(len < 0) len = 0;
+    buf[len] = 0;
+    char *sp, *is = strtok_r(buf, "|", &sp), *ds = strtok_r(NULL, "|", &sp);
+    if(!is || !ds){ httpd_resp_sendstr(req, "ERR"); return ESP_OK; }
+    creds_move(atoi(is), atoi(ds));
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static esp_err_t macro_run(httpd_req_t *req){
     char buf[8];
     recv_body(req, buf, sizeof(buf));
@@ -1202,6 +1270,7 @@ static void web_start(void){
     httpd_uri_t u10={.uri="/wifi/list",.method=HTTP_GET,.handler=wifi_list_get};
     httpd_uri_t u11={.uri="/wifi/delete",.method=HTTP_POST,.handler=wifi_delete_post};
     httpd_uri_t u12={.uri="/wifi/connect_idx",.method=HTTP_POST,.handler=wifi_connect_idx_post};
+    httpd_uri_t u12b={.uri="/wifi/move",.method=HTTP_POST,.handler=wifi_move_post};
     httpd_uri_t u13={.uri="/wifi/scan",.method=HTTP_GET,.handler=wifi_scan_get};
     httpd_uri_t u13b={.uri="/usb",.method=HTTP_GET,.handler=usb_page_get};
     httpd_uri_t u14={.uri="/usb/config",.method=HTTP_GET,.handler=usb_cfg_get_h};
@@ -1224,6 +1293,7 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u10);
     httpd_register_uri_handler(server,&u11);
     httpd_register_uri_handler(server,&u12);
+    httpd_register_uri_handler(server,&u12b);
     httpd_register_uri_handler(server,&u13);
     httpd_register_uri_handler(server,&u13b);
     httpd_register_uri_handler(server,&u14);

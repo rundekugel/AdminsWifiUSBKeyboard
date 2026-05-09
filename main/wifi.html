@@ -115,17 +115,26 @@ async function deleteIdx(idx){
 async function disconnect(){
  await fetch('/wifi/disconnect',{method:'POST',body:''});
 }
+async function moveNet(idx,dir){
+ await fetch('/wifi/move',{method:'POST',body:idx+'|'+dir});
+ loadNetworks();
+}
 async function loadNetworks(){
  const div=document.getElementById('net_list');
  try{
   const nets=await (await fetch('/wifi/list')).json();
   if(nets.length===0){div.innerHTML='<em>No saved networks.</em>';return;}
   div.innerHTML='';
-  nets.forEach(n=>{
+  nets.forEach((n,i)=>{
    const row=document.createElement('div');
    row.style='margin:4px 0;display:flex;align-items:center;gap:8px';
+   const isFirst=i===0, isLast=i===nets.length-1;
    row.innerHTML=
-    '<span style="flex:1">'+n.ssid+'</span>'+
+    '<span style="display:flex;flex-direction:column;gap:1px">'+
+     '<button onclick="moveNet('+n.idx+',-1)" style="padding:1px 5px;font-size:0.75em;line-height:1" '+(isFirst?'disabled':'')+'>▲</button>'+
+     '<button onclick="moveNet('+n.idx+',1)"  style="padding:1px 5px;font-size:0.75em;line-height:1" '+(isLast? 'disabled':'')+'>▼</button>'+
+    '</span>'+
+    '<span style="flex:1">'+n.ssid+(i===0?' <small style="color:#888">(highest priority)</small>':'')+'</span>'+
     '<button onclick="connectIdx('+n.idx+')">Connect</button>'+
     '<button onclick="deleteIdx('+n.idx+')" style="color:#c00">Delete</button>';
    div.appendChild(row);
