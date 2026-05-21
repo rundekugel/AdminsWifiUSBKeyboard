@@ -20,7 +20,7 @@ button{margin:4px;padding:8px}
 </style>
 </head>
 <body>
-<p><a href="/">&larr; Back</a></p>
+<p><a href="/">&#8592; Home</a> &nbsp;|&nbsp; <a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/help">&#63; Help</a></p>
 <h2>WiFi Settings V%%VERSION%%</h2>
 
 <div class="card">
@@ -28,6 +28,7 @@ button{margin:4px;padding:8px}
 &nbsp;<button onclick="disconnect()" style="font-size:0.8em;padding:4px 8px">Disconnect</button>
 &nbsp;<button onclick="startWps()" id="wps_btn" style="font-size:0.8em;padding:4px 8px">WPS</button>
 &nbsp;<span id="wps_status" style="font-size:0.85em;color:#a60;display:none">⏳ WPS searching…</span></p>
+<p style="margin:4px 0;font-size:0.9em"><strong>Web clients (last 60 s):</strong> <span id="st_web_ips">…</span></p>
 </div>
 
 <div class="card">
@@ -155,9 +156,17 @@ async function pollStatus(){
   document.getElementById('dot_sta').className='st-dot '+(j.sta?'on':'off');
   document.getElementById('wps_status').style.display=j.wps?'inline':'none';
   document.getElementById('wps_btn').disabled=!!j.wps;
+  document.getElementById('st_web').textContent=j.web_clients;
+  document.getElementById('dot_web').className='st-dot '+(j.web_clients>0?'on':'off');
  }catch(e){
   document.getElementById('st_sta').textContent='?';
  }
+}
+async function pollWebClients(){
+ try{
+  const ips=await (await fetch('/web/clients')).json();
+  document.getElementById('st_web_ips').textContent=ips.length?ips.join(', '):'none';
+ }catch(e){}
 }
 async function loadApCfg(){
  try{
@@ -181,6 +190,8 @@ loadNetworks();
 loadApCfg();
 setInterval(pollStatus,2000);
 pollStatus();
+setInterval(pollWebClients,5000);
+pollWebClients();
 </script>
 </body>
 </html>

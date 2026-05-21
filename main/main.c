@@ -12,6 +12,7 @@
 #include "esp_wps.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "lwip/sockets.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
 #include "driver/temperature_sensor.h"
@@ -28,8 +29,10 @@ extern const unsigned char usb_html_start[]   asm("_binary_usb_html_start");
 extern const unsigned char usb_html_end[]     asm("_binary_usb_html_end");
 extern const unsigned char help_html_start[]  asm("_binary_help_html_start");
 extern const unsigned char help_html_end[]    asm("_binary_help_html_end");
-extern const unsigned char hw_html_start[]    asm("_binary_hw_html_start");
-extern const unsigned char hw_html_end[]      asm("_binary_hw_html_end");
+extern const unsigned char hw_html_start[]      asm("_binary_hw_html_start");
+extern const unsigned char hw_html_end[]        asm("_binary_hw_html_end");
+extern const unsigned char monitor_html_start[] asm("_binary_monitor_html_start");
+extern const unsigned char monitor_html_end[]   asm("_binary_monitor_html_end");
 
 #define VERSION "0.4.3"
 #define REVISION 0
@@ -44,6 +47,75 @@ typedef struct {
 static macro_t macros[MAX_MACROS];
 static bool    hid_enumerated = false;
 static uint8_t hid_led_state  = 0;  /* bits: 0=NumLock 1=CapsLock 2=ScrollLock */
+
+/* Web client tracking — FD→IP captured at accept() time, timestamp updated per request */
+#define MAX_WEB_CLIENTS       16
+#define WEB_CLIENT_TIMEOUT_MS 60000
+typedef struct { int fd; uint32_t ip; int64_t last_ms; } web_client_t;
+static web_client_t s_web_clients[MAX_WEB_CLIENTS];
+static int          s_web_client_count = 0;
+
+/* Called by httpd right after accept() — socket is in CONNECTED state here.
+   With CONFIG_LWIP_IPV6=y the httpd uses AF_INET6 dual-stack; IPv4 clients
+   appear as IPv4-mapped IPv6 addresses (::ffff:a.b.c.d). */
+static esp_err_t httpd_open_fn(httpd_handle_t hd, int sockfd) {
+    (void)hd;
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+    if (lwip_getpeername(sockfd, (struct sockaddr *)&ss, &len) != 0) return ESP_OK;
+    uint32_t ip = 0;
+    if (ss.ss_family == AF_INET) {
+        ip = ((struct sockaddr_in *)&ss)->sin_addr.s_addr;
+    } else if (ss.ss_family == AF_INET6) {
+        /* extract IPv4 from IPv4-mapped address ::ffff:a.b.c.d */
+        uint8_t *b = ((struct sockaddr_in6 *)&ss)->sin6_addr.s6_addr;
+        if (b[10] == 0xFF && b[11] == 0xFF)   /* IPv4-mapped */
+            memcpy(&ip, b + 12, 4);
+    }
+    if (ip == 0) return ESP_OK;
+    int64_t now = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    /* update existing slot for this fd (reused fd) */
+    for (int i = 0; i < s_web_client_count; i++) {
+        if (s_web_clients[i].fd == sockfd) {
+            s_web_clients[i].ip = ip; s_web_clients[i].last_ms = now; return ESP_OK;
+        }
+    }
+    /* add new slot */
+    if (s_web_client_count < MAX_WEB_CLIENTS) {
+        s_web_clients[s_web_client_count++] = (web_client_t){sockfd, ip, now};
+    } else {
+        int old = 0;
+        for (int i = 1; i < MAX_WEB_CLIENTS; i++)
+            if (s_web_clients[i].last_ms < s_web_clients[old].last_ms) old = i;
+        s_web_clients[old] = (web_client_t){sockfd, ip, now};
+    }
+    return ESP_OK;
+}
+
+/* Called by httpd on close — replaces the default close(), so we must close the socket */
+static void httpd_close_fn(httpd_handle_t hd, int sockfd) {
+    (void)hd;
+    for (int i = 0; i < s_web_client_count; i++)
+        if (s_web_clients[i].fd == sockfd) { s_web_clients[i].fd = -1; break; }
+    close(sockfd);
+}
+
+/* Update last-seen timestamp for this request's socket */
+static void track_web_client(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    int64_t now = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    for (int i = 0; i < s_web_client_count; i++)
+        if (s_web_clients[i].fd == fd) { s_web_clients[i].last_ms = now; return; }
+}
+
+static int web_client_count_active(void) {
+    int64_t now = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    int n = 0;
+    for (int i = 0; i < s_web_client_count; i++)
+        if (s_web_clients[i].ip && now - s_web_clients[i].last_ms < WEB_CLIENT_TIMEOUT_MS) n++;
+    return n;
+}
 
 static bool    sta_connected   = false;
 static bool    s_sta_connecting = false; /* esp_wifi_connect() called, not yet got IP */
@@ -1136,17 +1208,47 @@ static esp_err_t macro_list(httpd_req_t *req){
     return ESP_OK;
 }
 
+static esp_err_t web_clients_get(httpd_req_t *req) {
+    int64_t now = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    /* collect unique IPs that are still active */
+    uint32_t seen[MAX_WEB_CLIENTS]; int seen_n = 0;
+    for (int i = 0; i < s_web_client_count; i++) {
+        if (!s_web_clients[i].ip) continue;
+        if (now - s_web_clients[i].last_ms >= WEB_CLIENT_TIMEOUT_MS) continue;
+        bool dup = false;
+        for (int j = 0; j < seen_n; j++) if (seen[j] == s_web_clients[i].ip) { dup = true; break; }
+        if (!dup) seen[seen_n++] = s_web_clients[i].ip;
+    }
+    char buf[MAX_WEB_CLIENTS * 20 + 8];
+    int pos = 0;
+    buf[pos++] = '[';
+    for (int i = 0; i < seen_n; i++) {
+        struct in_addr a = { .s_addr = seen[i] };
+        char ip_str[16];
+        ip4addr_ntoa_r((const ip4_addr_t *)&a, ip_str, sizeof(ip_str));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"%s\"", i ? "," : "", ip_str);
+    }
+    buf[pos++] = ']'; buf[pos] = '\0';
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
 static esp_err_t status_get(httpd_req_t *req){
+    track_web_client(req);
+    /* Guard: event callbacks aren't always reliable on rapid cable removal */
+    if (!tud_mounted() || tud_suspended()) hid_enumerated = false;
     wifi_sta_list_t sta;
     esp_wifi_ap_get_sta_list(&sta);
-    char out[160];
-    snprintf(out, sizeof(out), "{\"hid\":%s,\"clients\":%d,\"sta\":%s,\"ip\":\"%s\",\"leds\":%d,\"wps\":%s}",
+    char out[180];
+    snprintf(out, sizeof(out), "{\"hid\":%s,\"clients\":%d,\"sta\":%s,\"ip\":\"%s\",\"leds\":%d,\"wps\":%s,\"web_clients\":%d}",
              hid_enumerated ? "true" : "false",
              sta.num,
              sta_connected ? "true" : "false",
              sta_ip,
              hid_led_state,
-             s_wps_active ? "true" : "false");
+             s_wps_active ? "true" : "false",
+             web_client_count_active());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
@@ -1427,6 +1529,10 @@ static esp_err_t hw_page_get(httpd_req_t *req) {
     return send_html_versioned(req, hw_html_start, hw_html_end);
 }
 
+static esp_err_t monitor_page_get(httpd_req_t *req) {
+    return send_html_versioned(req, monitor_html_start, monitor_html_end);
+}
+
 static esp_err_t hw_cfg_get_h(httpd_req_t *req) {
     char out[128];
     snprintf(out, sizeof(out),
@@ -1477,6 +1583,8 @@ static void web_start(void){
     httpd_handle_t server=NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers = 30;
+    cfg.open_fn  = httpd_open_fn;
+    cfg.close_fn = httpd_close_fn;
     httpd_start(&server,&cfg);
 
     httpd_uri_t u1={.uri="/",.method=HTTP_GET,.handler=root_get};
@@ -1507,6 +1615,8 @@ static void web_start(void){
     httpd_uri_t u22={.uri="/hw/config",.method=HTTP_POST,.handler=hw_cfg_post_h};
     httpd_uri_t u23={.uri="/hw/config/save",.method=HTTP_POST,.handler=hw_cfg_save_h};
     httpd_uri_t u24={.uri="/hw/status",.method=HTTP_GET,.handler=hw_status_get};
+    httpd_uri_t u25={.uri="/monitor",.method=HTTP_GET,.handler=monitor_page_get};
+    httpd_uri_t u26={.uri="/web/clients",.method=HTTP_GET,.handler=web_clients_get};
 
     httpd_register_uri_handler(server,&u1);
     httpd_register_uri_handler(server,&u2);
@@ -1536,6 +1646,8 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u22);
     httpd_register_uri_handler(server,&u23);
     httpd_register_uri_handler(server,&u24);
+    httpd_register_uri_handler(server,&u25);
+    httpd_register_uri_handler(server,&u26);
 }
 
 static void usb_hid_init(void) {
