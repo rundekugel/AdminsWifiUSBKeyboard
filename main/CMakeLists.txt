@@ -6,4 +6,4 @@ EMBED_FILES "index.html" "wifi.html" "usb.html" "help.html" "hw.html" "monitor.h
 REQUIRES esp_tinyusb esp_wifi esp_netif esp_event nvs_flash esp_http_server driver esp_driver_rmt wpa_supplicant esp_adc esp_driver_tsens app_update mbedtls
 )
 
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/credentials_template.h ${CMAKE_CURRENT_SOURCE_DIR}/credentials.h COPYONLY)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/credentials-template.h ${CMAKE_CURRENT_SOURCE_DIR}/credentials.h COPYONLY)
