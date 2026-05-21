@@ -17,6 +17,7 @@
 #include "driver/rmt_tx.h"
 #include "driver/temperature_sensor.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_ota_ops.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "class/hid/hid_device.h"
@@ -33,6 +34,8 @@ extern const unsigned char hw_html_start[]      asm("_binary_hw_html_start");
 extern const unsigned char hw_html_end[]        asm("_binary_hw_html_end");
 extern const unsigned char monitor_html_start[] asm("_binary_monitor_html_start");
 extern const unsigned char monitor_html_end[]   asm("_binary_monitor_html_end");
+extern const unsigned char ota_html_start[]     asm("_binary_ota_html_start");
+extern const unsigned char ota_html_end[]       asm("_binary_ota_html_end");
 
 #define VERSION "0.4.3"
 #define REVISION 0
@@ -1579,10 +1582,338 @@ static esp_err_t wifi_wps_post(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* ---- OTA firmware update ---- */
+static esp_err_t ota_page_get(httpd_req_t *req) {
+    return send_html_versioned(req, ota_html_start, ota_html_end);
+}
+
+static esp_err_t ota_upload_post(httpd_req_t *req) {
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        return ESP_FAIL;
+    }
+    esp_ota_handle_t ota = 0;
+    if (esp_ota_begin(part, OTA_SIZE_UNKNOWN, &ota) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        return ESP_FAIL;
+    }
+    char buf[4096];
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int n = httpd_req_recv(req, buf, remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf));
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (n <= 0) { esp_ota_abort(ota); return ESP_FAIL; }
+        if (esp_ota_write(ota, buf, n) != ESP_OK) {
+            esp_ota_abort(ota);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+            return ESP_FAIL;
+        }
+        remaining -= n;
+    }
+    if (esp_ota_end(ota) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid image");
+        return ESP_FAIL;
+    }
+    if (esp_ota_set_boot_partition(part) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Set boot partition failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    schedule_restart();
+    return ESP_OK;
+}
+
+/* ---- JSON string escape helper ---- */
+/* Appends a JSON-escaped version of src into dst (dst must have room).
+   Returns number of bytes written (not counting NUL). */
+static int json_escape(char *dst, size_t dst_size, const char *src) {
+    int out = 0;
+    for (int i = 0; src[i] && out + 2 < (int)dst_size; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            if (out + 3 >= (int)dst_size) break;
+            dst[out++] = '\\'; dst[out++] = c;
+        } else if (c == '\n') {
+            if (out + 3 >= (int)dst_size) break;
+            dst[out++] = '\\'; dst[out++] = 'n';
+        } else if (c == '\r') {
+            if (out + 3 >= (int)dst_size) break;
+            dst[out++] = '\\'; dst[out++] = 'r';
+        } else if (c == '\t') {
+            if (out + 3 >= (int)dst_size) break;
+            dst[out++] = '\\'; dst[out++] = 't';
+        } else if (c < 0x20) {
+            if (out + 7 >= (int)dst_size) break;
+            out += snprintf(dst + out, dst_size - out, "\\u%04X", c);
+        } else {
+            dst[out++] = c;
+        }
+    }
+    dst[out] = '\0';
+    return out;
+}
+
+/* ---- /macro/export — returns JSON array of all macros ---- */
+/* Worst-case per macro: name 31 chars * 6 (\\uXXXX) + body 511 chars * 6 + JSON overhead ~20 */
+#define MACRO_JSON_MAX  (MAX_MACROS * (31*6 + 511*6 + 24) + 8)
+static esp_err_t macro_export_get(httpd_req_t *req) {
+    char *buf = malloc(MACRO_JSON_MAX);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+    int pos = 0;
+    pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "[");
+    int first = 1;
+    for (int i = 0; i < MAX_MACROS; i++) {
+        if (!macros[i].name[0]) continue;
+        pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "%s{\"name\":\"", first ? "" : ",");
+        pos += json_escape(buf + pos, MACRO_JSON_MAX - pos, macros[i].name);
+        pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "\",\"body\":\"");
+        pos += json_escape(buf + pos, MACRO_JSON_MAX - pos, macros[i].body);
+        pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "\"}");
+        first = 0;
+    }
+    pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "]");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"macros.json\"");
+    httpd_resp_sendstr(req, buf);
+    free(buf);
+    return ESP_OK;
+}
+
+/* ---- /macro/import — receives JSON array, replaces all macros ---- */
+/* Format: JSON array as produced by /macro/export.
+   Parsing is minimal: relies on the exact format we write. */
+static esp_err_t macro_import_post(httpd_req_t *req) {
+    size_t buf_size = MACRO_JSON_MAX;
+    char *buf = malloc(buf_size);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+    int len = recv_body(req, buf, buf_size);
+    if (len <= 0) { free(buf); httpd_resp_sendstr(req, "ERR"); return ESP_OK; }
+    buf[len] = '\0';
+
+    /* Clear all macros first */
+    for (int i = 0; i < MAX_MACROS; i++) {
+        if (macros[i].name[0]) { macros_delete_one(i); memset(&macros[i], 0, sizeof(macro_t)); }
+    }
+
+    /* Simple tokeniser: find "name":"<val>" and "body":"<val>" pairs.
+       We trust our own exported format (no embedded \" in practice but handle \n \r). */
+    int slot = 0;
+    char *p = buf;
+    while (slot < MAX_MACROS) {
+        char *nk = strstr(p, "\"name\":\"");
+        if (!nk) break;
+        nk += 8;
+        char *ne = strchr(nk, '"');
+        if (!ne) break;
+        *ne = '\0';
+
+        char *bk = strstr(ne + 1, "\"body\":\"");
+        if (!bk) break;
+        bk += 8;
+        /* body may contain escaped sequences; find the closing unescaped " */
+        char *be = bk;
+        while (*be && !(*be == '"' && *(be-1) != '\\')) be++;
+        if (!*be) break;
+        *be = '\0';
+
+        /* unescape \n \r \t \\ \" in body */
+        char body_dec[sizeof(macros[0].body)];
+        int di = 0;
+        for (int si = 0; bk[si] && di < (int)sizeof(body_dec) - 1; si++) {
+            if (bk[si] == '\\' && bk[si+1]) {
+                si++;
+                if      (bk[si] == 'n')  body_dec[di++] = '\n';
+                else if (bk[si] == 'r')  body_dec[di++] = '\r';
+                else if (bk[si] == 't')  body_dec[di++] = '\t';
+                else                     body_dec[di++] = bk[si];
+            } else {
+                body_dec[di++] = bk[si];
+            }
+        }
+        body_dec[di] = '\0';
+
+        strncpy(macros[slot].name, nk,       sizeof(macros[slot].name) - 1);
+        strncpy(macros[slot].body, body_dec,  sizeof(macros[slot].body) - 1);
+        macros_save_one(slot);
+        slot++;
+        p = be + 1;
+    }
+    free(buf);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/* ---- /settings/export — full backup JSON ---- */
+#define SETTINGS_JSON_MAX  (MACRO_JSON_MAX + WIFI_CRED_MAX*(33*6+65*6+24) + 1024)
+static esp_err_t settings_export_get(httpd_req_t *req) {
+    char *buf = malloc(SETTINGS_JSON_MAX);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+    int pos = 0;
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "{");
+
+    /* AP config */
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"ap\":{\"ssid\":\"");
+    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, ap_ssid);
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"pass\":\"");
+    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, ap_pass);
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"hostname\":\"");
+    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_hostname);
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"},");
+
+    /* USB config */
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos,
+                    "\"usb\":{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"",
+                    s_device_descriptor.idVendor, s_device_descriptor.idProduct);
+    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_manufacturer);
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"product\":\"");
+    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_product);
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"serial\":\"");
+    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_serial);
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"},");
+
+    /* HW config */
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos,
+                    "\"hw\":{\"led_pin\":%d,\"led_neo\":%d,\"led_inv\":%d,\"btn_pin\":%d},",
+                    s_led_pin, s_led_neopixel ? 1 : 0, s_led_invert ? 1 : 0, s_btn_pin);
+
+    /* WiFi saved networks */
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"wifi\":[");
+    for (int i = 0; i < wifi_cred_count; i++) {
+        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "%s{\"ssid\":\"", i ? "," : "");
+        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, wifi_creds[i].ssid);
+        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"pass\":\"");
+        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, wifi_creds[i].pass);
+        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"}");
+    }
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "],");
+
+    /* Macros */
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"macros\":[");
+    int first = 1;
+    for (int i = 0; i < MAX_MACROS; i++) {
+        if (!macros[i].name[0]) continue;
+        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "%s{\"name\":\"", first ? "" : ",");
+        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, macros[i].name);
+        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"body\":\"");
+        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, macros[i].body);
+        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"}");
+        first = 0;
+    }
+    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"adminkbd-backup.json\"");
+    httpd_resp_sendstr(req, buf);
+    free(buf);
+    return ESP_OK;
+}
+
+/* ---- /settings/import — full restore ---- */
+/* Receives the same JSON produced by /settings/export.
+   Parses top-level keys; WiFi networks are appended (not replaced) to avoid
+   locking the user out. All other settings overwrite current values and are
+   saved to NVS. A restart is required for AP/USB/HW to take effect. */
+static esp_err_t settings_import_post(httpd_req_t *req) {
+    size_t buf_size = SETTINGS_JSON_MAX;
+    char *buf = malloc(buf_size);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+    int len = recv_body(req, buf, buf_size);
+    if (len <= 0) { free(buf); httpd_resp_sendstr(req, "ERR"); return ESP_OK; }
+    buf[len] = '\0';
+
+    /* --- AP config --- */
+    char *ap = strstr(buf, "\"ap\":{");
+    if (ap) {
+        char *s = strstr(ap, "\"ssid\":\""); if (s) { s+=8; char *e=strchr(s,'"'); if(e){*e=0; strncpy(ap_ssid,s,sizeof(ap_ssid)-1); *e='"';} }
+        char *q = strstr(ap, "\"pass\":\""); if (q) { q+=8; char *e=strchr(q,'"'); if(e){*e=0; strncpy(ap_pass,q,sizeof(ap_pass)-1); *e='"';} }
+        char *h = strstr(ap, "\"hostname\":\""); if (h) { h+=12; char *e=strchr(h,'"'); if(e){*e=0; if(h[0]) strncpy(s_hostname,h,sizeof(s_hostname)-1); *e='"';} }
+        ap_cfg_save();
+    }
+
+    /* --- USB config --- */
+    char *usb = strstr(buf, "\"usb\":{");
+    if (usb) {
+        char *v = strstr(usb, "\"vid\":\""); if (v) { v+=7; char *e=strchr(v,'"'); if(e){*e=0; s_device_descriptor.idVendor=(uint16_t)strtol(v,NULL,16); *e='"';} }
+        char *pi = strstr(usb, "\"pid\":\""); if (pi) { pi+=7; char *e=strchr(pi,'"'); if(e){*e=0; s_device_descriptor.idProduct=(uint16_t)strtol(pi,NULL,16); *e='"';} }
+        char *m = strstr(usb, "\"mfr\":\""); if (m) { m+=7; char *e=strchr(m,'"'); if(e){*e=0; strncpy(s_manufacturer,m,sizeof(s_manufacturer)-1); *e='"';} }
+        char *pr = strstr(usb, "\"product\":\""); if (pr) { pr+=11; char *e=strchr(pr,'"'); if(e){*e=0; strncpy(s_product,pr,sizeof(s_product)-1); *e='"';} }
+        char *sr = strstr(usb, "\"serial\":\""); if (sr) { sr+=10; char *e=strchr(sr,'"'); if(e){*e=0; strncpy(s_serial,sr,sizeof(s_serial)-1); *e='"';} }
+        usb_cfg_save();
+    }
+
+    /* --- HW config --- */
+    char *hw = strstr(buf, "\"hw\":{");
+    if (hw) {
+        char *lp = strstr(hw, "\"led_pin\":"); if (lp) { lp+=10; s_led_pin=atoi(lp); }
+        char *ln = strstr(hw, "\"led_neo\":"); if (ln) { ln+=10; s_led_neopixel=(atoi(ln)!=0); }
+        char *li = strstr(hw, "\"led_inv\":"); if (li) { li+=10; s_led_invert=(atoi(li)!=0); }
+        char *bp = strstr(hw, "\"btn_pin\":"); if (bp) { bp+=10; s_btn_pin=atoi(bp); }
+        hw_cfg_save();
+    }
+
+    /* --- WiFi networks --- */
+    char *wf = strstr(buf, "\"wifi\":[");
+    if (wf) {
+        wf += 8;
+        char *p = wf;
+        while (1) {
+            char *s = strstr(p, "\"ssid\":\""); if (!s) break;
+            s += 8; char *se = strchr(s, '"'); if (!se) break; *se = 0;
+            char *q = strstr(se+1, "\"pass\":\""); if (!q) { *se='"'; break; }
+            q += 8; char *qe = strchr(q, '"'); if (!qe) { *se='"'; break; } *qe = 0;
+            creds_add(s, q);
+            *se = '"'; *qe = '"';
+            p = qe + 1;
+        }
+    }
+
+    /* --- Macros --- */
+    char *mk = strstr(buf, "\"macros\":[");
+    if (mk) {
+        /* Clear all existing macros */
+        for (int i = 0; i < MAX_MACROS; i++) {
+            if (macros[i].name[0]) { macros_delete_one(i); memset(&macros[i], 0, sizeof(macro_t)); }
+        }
+        int slot = 0;
+        char *p = mk + 10;
+        while (slot < MAX_MACROS) {
+            char *nk = strstr(p, "\"name\":\""); if (!nk) break;
+            nk += 8; char *ne = strchr(nk, '"'); if (!ne) break; *ne = '\0';
+            char *bk = strstr(ne+1, "\"body\":\""); if (!bk) break;
+            bk += 8;
+            char *be = bk;
+            while (*be && !(*be == '"' && *(be-1) != '\\')) be++;
+            if (!*be) break;
+            *be = '\0';
+            /* unescape body */
+            char body_dec[sizeof(macros[0].body)];
+            int di = 0;
+            for (int si = 0; bk[si] && di < (int)sizeof(body_dec)-1; si++) {
+                if (bk[si]=='\\' && bk[si+1]) { si++;
+                    if(bk[si]=='n') body_dec[di++]='\n';
+                    else if(bk[si]=='r') body_dec[di++]='\r';
+                    else if(bk[si]=='t') body_dec[di++]='\t';
+                    else body_dec[di++]=bk[si];
+                } else body_dec[di++]=bk[si];
+            }
+            body_dec[di]='\0';
+            strncpy(macros[slot].name, nk,      sizeof(macros[slot].name)-1);
+            strncpy(macros[slot].body, body_dec, sizeof(macros[slot].body)-1);
+            macros_save_one(slot);
+            slot++; p = be+1;
+        }
+    }
+
+    free(buf);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static void web_start(void){
     httpd_handle_t server=NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 30;
+    cfg.max_uri_handlers = 34;
     cfg.open_fn  = httpd_open_fn;
     cfg.close_fn = httpd_close_fn;
     httpd_start(&server,&cfg);
@@ -1617,6 +1948,12 @@ static void web_start(void){
     httpd_uri_t u24={.uri="/hw/status",.method=HTTP_GET,.handler=hw_status_get};
     httpd_uri_t u25={.uri="/monitor",.method=HTTP_GET,.handler=monitor_page_get};
     httpd_uri_t u26={.uri="/web/clients",.method=HTTP_GET,.handler=web_clients_get};
+    httpd_uri_t u27={.uri="/ota",.method=HTTP_GET,.handler=ota_page_get};
+    httpd_uri_t u28={.uri="/ota/upload",.method=HTTP_POST,.handler=ota_upload_post};
+    httpd_uri_t u29={.uri="/macro/export",.method=HTTP_GET,.handler=macro_export_get};
+    httpd_uri_t u30={.uri="/macro/import",.method=HTTP_POST,.handler=macro_import_post};
+    httpd_uri_t u31={.uri="/settings/export",.method=HTTP_GET,.handler=settings_export_get};
+    httpd_uri_t u32={.uri="/settings/import",.method=HTTP_POST,.handler=settings_import_post};
 
     httpd_register_uri_handler(server,&u1);
     httpd_register_uri_handler(server,&u2);
@@ -1648,6 +1985,12 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u24);
     httpd_register_uri_handler(server,&u25);
     httpd_register_uri_handler(server,&u26);
+    httpd_register_uri_handler(server,&u27);
+    httpd_register_uri_handler(server,&u28);
+    httpd_register_uri_handler(server,&u29);
+    httpd_register_uri_handler(server,&u30);
+    httpd_register_uri_handler(server,&u31);
+    httpd_register_uri_handler(server,&u32);
 }
 
 static void usb_hid_init(void) {
@@ -1680,6 +2023,7 @@ void app_main(void){
     s_hid_queue = xQueueCreate(HID_QUEUE_DEPTH, sizeof(hid_cmd_t));
     xTaskCreate(hid_worker_task, "hid_worker", 4096, NULL, 5, NULL);
 
+    esp_ota_mark_app_valid_cancel_rollback();
     hw_monitor_init();
     usb_hid_init();
     wifi_init_ap();
