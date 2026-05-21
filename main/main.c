@@ -1654,29 +1654,30 @@ static int json_escape(char *dst, size_t dst_size, const char *src) {
     return out;
 }
 
-/* ---- /macro/export — returns JSON array of all macros ---- */
-/* Worst-case per macro: name 31 chars * 6 (\\uXXXX) + body 511 chars * 6 + JSON overhead ~20 */
-#define MACRO_JSON_MAX  (MAX_MACROS * (31*6 + 511*6 + 24) + 8)
+/* ---- /macro/export — returns JSON array of all macros (chunked) ---- */
+/* Per-macro worst-case: name 31*6 + body 511*6 + JSON overhead 24 = 3252 bytes */
+#define MACRO_CHUNK_MAX  (31*6 + 511*6 + 28)
 static esp_err_t macro_export_get(httpd_req_t *req) {
-    char *buf = malloc(MACRO_JSON_MAX);
-    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
-    int pos = 0;
-    pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "[");
+    char *chunk = malloc(MACRO_CHUNK_MAX);
+    if (!chunk) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"macros.json\"");
+    httpd_resp_send_chunk(req, "[", 1);
     int first = 1;
     for (int i = 0; i < MAX_MACROS; i++) {
         if (!macros[i].name[0]) continue;
-        pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "%s{\"name\":\"", first ? "" : ",");
-        pos += json_escape(buf + pos, MACRO_JSON_MAX - pos, macros[i].name);
-        pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "\",\"body\":\"");
-        pos += json_escape(buf + pos, MACRO_JSON_MAX - pos, macros[i].body);
-        pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "\"}");
+        int pos = 0;
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "%s{\"name\":\"", first ? "" : ",");
+        pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, macros[i].name);
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\",\"body\":\"");
+        pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, macros[i].body);
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\"}");
+        httpd_resp_send_chunk(req, chunk, pos);
         first = 0;
     }
-    pos += snprintf(buf + pos, MACRO_JSON_MAX - pos, "]");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"macros.json\"");
-    httpd_resp_sendstr(req, buf);
-    free(buf);
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
+    free(chunk);
     return ESP_OK;
 }
 
@@ -1684,7 +1685,7 @@ static esp_err_t macro_export_get(httpd_req_t *req) {
 /* Format: JSON array as produced by /macro/export.
    Parsing is minimal: relies on the exact format we write. */
 static esp_err_t macro_import_post(httpd_req_t *req) {
-    size_t buf_size = MACRO_JSON_MAX;
+    size_t buf_size = MAX_MACROS * (31*2 + 511*2 + 24) + 64;
     char *buf = malloc(buf_size);
     if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
     int len = recv_body(req, buf, buf_size);
@@ -1744,68 +1745,73 @@ static esp_err_t macro_import_post(httpd_req_t *req) {
     return ESP_OK;
 }
 
-/* ---- /settings/export — full backup JSON ---- */
-#define SETTINGS_JSON_MAX  (MACRO_JSON_MAX + WIFI_CRED_MAX*(33*6+65*6+24) + 1024)
+/* ---- /settings/export — full backup JSON (chunked) ---- */
+/* Reuses MACRO_CHUNK_MAX for macro chunks; small stack buf for config fields */
 static esp_err_t settings_export_get(httpd_req_t *req) {
-    char *buf = malloc(SETTINGS_JSON_MAX);
-    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
-    int pos = 0;
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "{");
+    char *chunk = malloc(MACRO_CHUNK_MAX);
+    if (!chunk) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"adminkbd-backup.json\"");
 
     /* AP config */
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"ap\":{\"ssid\":\"");
-    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, ap_ssid);
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"pass\":\"");
-    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, ap_pass);
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"hostname\":\"");
-    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_hostname);
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"},");
+    int pos = 0;
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "{\"ap\":{\"ssid\":\"");
+    pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, ap_ssid);
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\",\"pass\":\"");
+    pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, ap_pass);
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\",\"hostname\":\"");
+    pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, s_hostname);
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\"},");
+    httpd_resp_send_chunk(req, chunk, pos);
 
     /* USB config */
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos,
+    pos = 0;
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos,
                     "\"usb\":{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"",
                     s_device_descriptor.idVendor, s_device_descriptor.idProduct);
-    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_manufacturer);
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"product\":\"");
-    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_product);
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"serial\":\"");
-    pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, s_serial);
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"},");
+    pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, s_manufacturer);
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\",\"product\":\"");
+    pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, s_product);
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\",\"serial\":\"");
+    pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, s_serial);
+    pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\"},");
+    httpd_resp_send_chunk(req, chunk, pos);
 
     /* HW config */
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos,
-                    "\"hw\":{\"led_pin\":%d,\"led_neo\":%d,\"led_inv\":%d,\"btn_pin\":%d},",
-                    s_led_pin, s_led_neopixel ? 1 : 0, s_led_invert ? 1 : 0, s_btn_pin);
+    pos = snprintf(chunk, MACRO_CHUNK_MAX,
+                   "\"hw\":{\"led_pin\":%d,\"led_neo\":%d,\"led_inv\":%d,\"btn_pin\":%d},",
+                   s_led_pin, s_led_neopixel ? 1 : 0, s_led_invert ? 1 : 0, s_btn_pin);
+    httpd_resp_send_chunk(req, chunk, pos);
 
     /* WiFi saved networks */
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"wifi\":[");
+    httpd_resp_send_chunk(req, "\"wifi\":[", 8);
     for (int i = 0; i < wifi_cred_count; i++) {
-        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "%s{\"ssid\":\"", i ? "," : "");
-        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, wifi_creds[i].ssid);
-        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"pass\":\"");
-        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, wifi_creds[i].pass);
-        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"}");
+        pos = 0;
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "%s{\"ssid\":\"", i ? "," : "");
+        pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, wifi_creds[i].ssid);
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\",\"pass\":\"");
+        pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, wifi_creds[i].pass);
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\"}");
+        httpd_resp_send_chunk(req, chunk, pos);
     }
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "],");
+    httpd_resp_send_chunk(req, "],\"macros\":[", 12);
 
     /* Macros */
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"macros\":[");
     int first = 1;
     for (int i = 0; i < MAX_MACROS; i++) {
         if (!macros[i].name[0]) continue;
-        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "%s{\"name\":\"", first ? "" : ",");
-        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, macros[i].name);
-        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\",\"body\":\"");
-        pos += json_escape(buf + pos, SETTINGS_JSON_MAX - pos, macros[i].body);
-        pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "\"}");
+        pos = 0;
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "%s{\"name\":\"", first ? "" : ",");
+        pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, macros[i].name);
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\",\"body\":\"");
+        pos += json_escape(chunk + pos, MACRO_CHUNK_MAX - pos, macros[i].body);
+        pos += snprintf(chunk + pos, MACRO_CHUNK_MAX - pos, "\"}");
+        httpd_resp_send_chunk(req, chunk, pos);
         first = 0;
     }
-    pos += snprintf(buf + pos, SETTINGS_JSON_MAX - pos, "]}");
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"adminkbd-backup.json\"");
-    httpd_resp_sendstr(req, buf);
-    free(buf);
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);
+    free(chunk);
     return ESP_OK;
 }
 
@@ -1815,7 +1821,7 @@ static esp_err_t settings_export_get(httpd_req_t *req) {
    locking the user out. All other settings overwrite current values and are
    saved to NVS. A restart is required for AP/USB/HW to take effect. */
 static esp_err_t settings_import_post(httpd_req_t *req) {
-    size_t buf_size = SETTINGS_JSON_MAX;
+    size_t buf_size = MAX_MACROS * (31*2 + 511*2 + 24) + WIFI_CRED_MAX * (33*2 + 65*2 + 24) + 1024;
     char *buf = malloc(buf_size);
     if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
     int len = recv_body(req, buf, buf_size);
@@ -1913,7 +1919,7 @@ static esp_err_t settings_import_post(httpd_req_t *req) {
 static void web_start(void){
     httpd_handle_t server=NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 34;
+    cfg.max_uri_handlers = 40;
     cfg.open_fn  = httpd_open_fn;
     cfg.close_fn = httpd_close_fn;
     httpd_start(&server,&cfg);
