@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Admin-Keyboard – Firmware V%%VERSION%%</title>
+<style>
+body{font-family:Arial;margin:20px;max-width:860px}
+button{margin:4px;padding:8px}
+.card{border:1px solid #ccc;padding:10px;margin:8px 0}
+#statusBar{display:flex;gap:16px;flex-wrap:wrap;padding:6px 10px;background:#f0f0f0;border-radius:4px;margin-bottom:8px;font-size:0.9em}
+.st-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#ccc;margin-right:4px;vertical-align:middle}
+.st-dot.on{background:#2a2}
+.st-dot.off{background:#c44}
+#prog-wrap{background:#ddd;border-radius:4px;height:18px;margin:8px 0;display:none}
+#prog-bar{background:#2a2;height:18px;border-radius:4px;width:0%;transition:width 0.2s}
+#ota-status{font-size:0.9em;margin:4px 0}
+.note{background:#fffbe6;border:1px solid #e6d800;padding:6px 10px;border-radius:4px;font-size:0.9em;margin:6px 0}
+</style>
+</head>
+<body>
+<p><a href="/">&#8592; Home</a> &nbsp;|&nbsp; <a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/ota">&#11014; Firmware</a> &nbsp; <a href="/help">&#63; Help</a></p>
+<div id="statusBar">
+  <span><span class="st-dot" id="dot_hid"></span><strong>USB HID:</strong> <span id="st_hid">…</span></span>
+  <span><span class="st-dot" id="dot_wifi"></span><strong>WiFi Clients:</strong> <span id="st_clients">…</span></span>
+  <span><span class="st-dot" id="dot_sta"></span><strong>WiFi STA:</strong> <span id="st_sta">…</span></span>
+  <span><span class="st-dot" id="dot_web"></span><strong>Web Clients:</strong> <span id="st_web">…</span></span>
+</div>
+<h2>Firmware Update V%%VERSION%%</h2>
+
+<div class="card">
+<h3>Upload firmware</h3>
+<p class="note">Select the <strong>encrypted .bin.enc</strong> file produced by <code>tools/encrypt_firmware.py</code>. The device verifies the SHA-256 hash and AES-256 key before flashing — an incorrect or unencrypted file will be rejected. The device reboots automatically after a successful upload.</p>
+<input type="file" id="bin_file" accept=".enc,.bin">
+<br>
+<button id="upload_btn" onclick="startUpload()" style="margin-top:8px">Upload &amp; Flash</button>
+<div id="prog-wrap"><div id="prog-bar"></div></div>
+<div id="ota-status"></div>
+</div>
+
+<script>
+let pollTimer=null;
+function startPolling(){ pollTimer=setInterval(pollStatus,2000); }
+function stopPolling(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
+
+async function startUpload(){
+ const file=document.getElementById('bin_file').files[0];
+ if(!file){alert('Select a .bin file first.');return;}
+ const btn=document.getElementById('upload_btn');
+ const wrap=document.getElementById('prog-wrap');
+ const bar=document.getElementById('prog-bar');
+ const status=document.getElementById('ota-status');
+ btn.disabled=true;
+ wrap.style.display='block';
+ bar.style.width='0%';
+ status.textContent='Uploading…';
+ stopPolling();  /* avoid competing connections during upload */
+ const xhr=new XMLHttpRequest();
+ xhr.upload.onprogress=e=>{
+  if(e.lengthComputable){
+   const pct=Math.round(e.loaded/e.total*100);
+   bar.style.width=pct+'%';
+   status.textContent='Uploading… '+pct+'%';
+  }
+ };
+ xhr.onload=()=>{
+  if(xhr.status===200){
+   bar.style.width='100%';
+   bar.style.background='#2a2';
+   status.textContent='Flash successful – device is restarting…';
+  } else {
+   bar.style.background='#c44';
+   status.textContent='Error: '+xhr.responseText;
+   btn.disabled=false;
+   startPolling();
+  }
+ };
+ xhr.onerror=()=>{
+  bar.style.background='#c44';
+  status.textContent='Upload failed (connection error)';
+  btn.disabled=false;
+  startPolling();
+ };
+ xhr.open('POST','/ota/upload');
+ xhr.setRequestHeader('Content-Type','application/octet-stream');
+ xhr.send(file);
+}
+async function pollStatus(){
+ try{
+  const j=await (await fetch('/status')).json();
+  document.getElementById('st_hid').textContent=j.hid?'Enumerated':'Not connected';
+  document.getElementById('dot_hid').className='st-dot '+(j.hid?'on':'off');
+  document.getElementById('st_clients').textContent=j.clients;
+  document.getElementById('dot_wifi').className='st-dot '+(j.clients>0?'on':'off');
+  document.getElementById('st_sta').textContent=j.sta?(j.ip||'connected'):'Not connected';
+  document.getElementById('dot_sta').className='st-dot '+(j.sta?'on':'off');
+  document.getElementById('st_web').textContent=j.web_clients;
+  document.getElementById('dot_web').className='st-dot '+(j.web_clients>0?'on':'off');
+ }catch(e){}
+}
+startPolling();
+pollStatus();
+</script>
+</body>
+</html>

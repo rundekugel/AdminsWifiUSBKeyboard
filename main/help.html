@@ -8,6 +8,12 @@ body{font-family:Arial;margin:20px;max-width:860px}
 h2{margin-bottom:4px}
 h3{margin:18px 0 6px;border-bottom:1px solid #ddd;padding-bottom:4px}
 h4{margin:12px 0 4px}
+#toc{background:#f8f8f8;border:1px solid #ddd;padding:10px 16px;border-radius:4px;margin:10px 0;display:inline-block;min-width:220px}
+#toc h3{margin:0 0 8px;border:none;padding:0;font-size:1em}
+#toc ol{margin:0;padding-left:20px}
+#toc li{margin:3px 0;font-size:0.9em}
+#toc a{text-decoration:none;color:#333}
+#toc a:hover{text-decoration:underline}
 .card{border:1px solid #ccc;padding:10px 16px;margin:10px 0;border-radius:4px}
 code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:0.92em}
 pre{background:#f5f5f5;padding:10px;border-radius:4px;overflow-x:auto;font-size:0.88em;line-height:1.5}
@@ -18,14 +24,40 @@ th,td{border:1px solid #ccc;padding:5px 8px;font-size:0.9em}
 </style>
 </head>
 <body>
-<p><a href="/">&#8592; Home</a> &nbsp;|&nbsp; <a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/help">&#63; Help</a></p>
+<p><a href="/">&#8592; Home</a> &nbsp;|&nbsp; <a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/ota">&#11014; Firmware</a> &nbsp; <a href="/help">&#63; Help</a></p>
 <h2>Admin-Keyboard – Help V%%VERSION%%</h2>
 <p>Admin-Keyboard is an ESP32-S3 device that acts as a <strong>USB HID keyboard</strong> and is
 configured over a <strong>Wi-Fi web interface</strong>. Connect to it via its Wi-Fi access point
 (or your local network), open the web UI, and send keystrokes or run macros to the host PC.</p>
 
+<nav id="toc">
+<h3>Contents</h3>
+<ol>
+  <li><a href="#getting-started">Getting started</a></li>
+  <li><a href="#console">Console page</a>
+    <ol>
+      <li><a href="#status-bar">Status bar</a></li>
+      <li><a href="#send-keys">Send keys</a></li>
+      <li><a href="#lock-keys">Lock keys</a></li>
+      <li><a href="#media-keys">Media keys</a></li>
+      <li><a href="#macros-console">Macros</a></li>
+    </ol>
+  </li>
+  <li><a href="#macro-language">Macro script language</a>
+    <ol>
+      <li><a href="#key-names">Key names</a></li>
+      <li><a href="#modifier-names">Modifier names</a></li>
+      <li><a href="#media-names">Media key names</a></li>
+    </ol>
+  </li>
+  <li><a href="#wifi">Wi-Fi settings</a></li>
+  <li><a href="#usb-device">USB Device config</a></li>
+  <li><a href="#hardware">Hardware settings</a></li>
+</ol>
+</nav>
+
 <div class="card">
-<h3>Getting started</h3>
+<h3 id="getting-started">Getting started</h3>
 <ol>
   <li>Power the device. It broadcasts a Wi-Fi access point (default SSID printed on the device or set in <a href="/wifi">Wi-Fi Settings</a>).</li>
   <li>Connect your phone or laptop to that AP.</li>
@@ -37,9 +69,9 @@ configured over a <strong>Wi-Fi web interface</strong>. Connect to it via its Wi
 </div>
 
 <div class="card">
-<h3>Console page</h3>
+<h3 id="console">Console page</h3>
 
-<h4>Status bar</h4>
+<h4 id="status-bar">Status bar</h4>
 <table>
   <tr><th>Indicator</th><th>Meaning</th></tr>
   <tr><td>USB HID</td><td>Whether the target PC has enumerated the keyboard. Keys only work when this is green.</td></tr>
@@ -47,7 +79,7 @@ configured over a <strong>Wi-Fi web interface</strong>. Connect to it via its Wi
   <tr><td>Wi-Fi STA</td><td>Whether the device itself is connected to an external Wi-Fi network, and its IP on that network.</td></tr>
 </table>
 
-<h4>Send keys</h4>
+<h4 id="send-keys">Send keys</h4>
 <p>Click in the text area and type. With <strong>Send keys immediately</strong> checked every keystroke
 is forwarded in real-time (including Ctrl, Shift, Alt combinations). Uncheck it to compose text
 first, then click <strong>Send as Text</strong> to type it all at once.</p>
@@ -55,21 +87,21 @@ first, then click <strong>Send as Text</strong> to type it all at once.</p>
 extra modifiers that are combined with each key you press.</p>
 <p>Works on mobile too — the soft keyboard sends text via the input event path.</p>
 
-<h4>Lock keys</h4>
+<h4 id="lock-keys">Lock keys</h4>
 <p>The <strong>NUM / CAPS / SCRL</strong> indicators reflect the lock-key state reported by the host.
 Click them to toggle the corresponding lock key on the host.</p>
 
-<h4>Media keys</h4>
+<h4 id="media-keys">Media keys</h4>
 <p>The media buttons send consumer-control HID reports: Play/Pause, Previous, Next, Mute,
 Volume&nbsp;Down, Volume&nbsp;Up.</p>
 
-<h4>Macros</h4>
+<h4 id="macros-console">Macros</h4>
 <p>A macro is a named script stored in flash. Save up to 20 macros. Click <strong>Run</strong> to
 execute a macro; it runs in the background so you can continue using the UI.</p>
 </div>
 
 <div class="card">
-<h3>Macro script language</h3>
+<h3 id="macro-language">Macro script language</h3>
 <p>Each line of a macro body is one command. Blank lines and unknown commands are ignored.</p>
 
 <table>
@@ -89,7 +121,7 @@ COMBO LCTRL+S
 DELAY 1000
 MEDIA VOL_UP</pre>
 
-<h4>Key names (<code>KEY</code> / <code>COMBO</code>)</h4>
+<h4 id="key-names">Key names (<code>KEY</code> / <code>COMBO</code>)</h4>
 <table>
   <tr><th>Name(s)</th><th>Key</th></tr>
   <tr><td><code>A</code>–<code>Z</code>, <code>a</code>–<code>z</code></td><td>Letter keys (physical position, no shift)</td></tr>
@@ -129,7 +161,7 @@ MEDIA VOL_UP</pre>
   <tr><td><code>INTLBACKSLASH</code></td><td>ISO key between left Shift and Z (Europe key 2)</td></tr>
 </table>
 
-<h4>Modifier names (<code>COMBO</code>)</h4>
+<h4 id="modifier-names">Modifier names (<code>COMBO</code>)</h4>
 <table>
   <tr><th>Name(s)</th><th>Modifier</th></tr>
   <tr><td><code>LCTRL</code>, <code>CTRL</code>, <code>CONTROL</code></td><td>Left Ctrl</td></tr>
@@ -141,7 +173,7 @@ MEDIA VOL_UP</pre>
   <tr><td><code>SUPER</code>, <code>GUI</code>, <code>WIN</code>, <code>META</code></td><td>Left GUI (Windows / Command / Super)</td></tr>
 </table>
 
-<h4>Media key names (<code>MEDIA</code>)</h4>
+<h4 id="media-names">Media key names (<code>MEDIA</code>)</h4>
 <table>
   <tr><th>Name(s)</th><th>Action</th></tr>
   <tr><td><code>PLAY_PAUSE</code>, <code>PLAY</code>, <code>PLAYPAUSE</code></td><td>Play / Pause</td></tr>
@@ -154,7 +186,7 @@ MEDIA VOL_UP</pre>
 </div>
 
 <div class="card">
-<h3>Wi-Fi settings</h3>
+<h3 id="wifi">Wi-Fi settings</h3>
 
 <h4>Access Point (AP)</h4>
 <p>The device always runs its own AP so you can reach it even without an external network.
@@ -171,7 +203,7 @@ any entry there.</p>
 </div>
 
 <div class="card">
-<h3>USB Device config</h3>
+<h3 id="usb-device">USB Device config</h3>
 <p>Accessible from <a href="/usb">USB Device</a>. Changes take effect after restart.</p>
 <table>
   <tr><th>Field</th><th>Description</th></tr>
@@ -184,7 +216,7 @@ any entry there.</p>
 </div>
 
 <div class="card">
-<h3>Hardware settings</h3>
+<h3 id="hardware">Hardware settings</h3>
 <p>Accessible from <a href="/hw">Hardware</a>. Changes take effect after restart.</p>
 
 <h4>Status LED</h4>
