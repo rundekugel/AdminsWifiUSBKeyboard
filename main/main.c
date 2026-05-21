@@ -9,10 +9,13 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_wps.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
+#include "driver/temperature_sensor.h"
+#include "esp_adc/adc_oneshot.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "class/hid/hid_device.h"
@@ -25,8 +28,10 @@ extern const unsigned char usb_html_start[]   asm("_binary_usb_html_start");
 extern const unsigned char usb_html_end[]     asm("_binary_usb_html_end");
 extern const unsigned char help_html_start[]  asm("_binary_help_html_start");
 extern const unsigned char help_html_end[]    asm("_binary_help_html_end");
+extern const unsigned char hw_html_start[]    asm("_binary_hw_html_start");
+extern const unsigned char hw_html_end[]      asm("_binary_hw_html_end");
 
-#define VERSION "0.4.2"
+#define VERSION "0.4.3"
 #define REVISION 0
 
 typedef struct {
@@ -53,6 +58,7 @@ static volatile bool s_scan_done = false;
 #define LED_PIN_DEFAULT (-1)   /* -1 = disabled; configure via USB page */
 static int  s_led_pin      = LED_PIN_DEFAULT;
 static bool s_led_neopixel = false;
+static bool s_led_invert   = false;  /* active-low LED: invert GPIO output */
 static volatile int s_led_logical = 0;  /* last written logical level */
 
 #define LED_CMD_BOOT      0   /* 2 Hz blink while booting */
@@ -105,7 +111,7 @@ static void led_write(int v) {
     if (s_led_neopixel) {
         neo_write(v ? s_neo_rgb[0] : 0, v ? s_neo_rgb[1] : 0, v ? s_neo_rgb[2] : 0);
     } else if (s_led_pin >= 0) {
-        gpio_set_level(s_led_pin, v);
+        gpio_set_level(s_led_pin, s_led_invert ? !v : v);
     }
 }
 
@@ -124,7 +130,7 @@ static void led_key_invert(bool inv) {
                       s_led_logical ? s_neo_rgb[2] : 0);
         }
     } else if (s_led_pin >= 0) {
-        gpio_set_level(s_led_pin, inv ? !s_led_logical : s_led_logical);
+        gpio_set_level(s_led_pin, (bool)s_led_logical ^ (bool)inv ^ s_led_invert);
     }
 }
 
@@ -232,23 +238,28 @@ static void macros_delete_one(int idx) {
 
 /* ---- AP config (NVS) ---- */
 #define AP_CFG_NS "ap_cfg"
-static char ap_ssid[33] = "AdminKbd";
-static char ap_pass[65] = "12345678";
+static char ap_ssid[33]    = "AdminKbd";
+static char ap_pass[65]    = "12345678";
+static char s_hostname[33] = "adminkbd";
+static int  s_btn_pin      = 0;         /* WPS long-press button GPIO, -1=disabled */
+static volatile bool s_wps_active = false;
 
 static void ap_cfg_load(void) {
     nvs_handle_t h;
     if (nvs_open(AP_CFG_NS, NVS_READONLY, &h) != ESP_OK) return;
     size_t len;
-    len = sizeof(ap_ssid); nvs_get_str(h, "ssid", ap_ssid, &len);
-    len = sizeof(ap_pass); nvs_get_str(h, "pass", ap_pass, &len);
+    len = sizeof(ap_ssid);    nvs_get_str(h, "ssid",     ap_ssid,    &len);
+    len = sizeof(ap_pass);    nvs_get_str(h, "pass",     ap_pass,    &len);
+    len = sizeof(s_hostname); nvs_get_str(h, "hostname", s_hostname, &len);
     nvs_close(h);
 }
 
 static void ap_cfg_save(void) {
     nvs_handle_t h;
     if (nvs_open(AP_CFG_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_str(h, "ssid", ap_ssid);
-    nvs_set_str(h, "pass", ap_pass);
+    nvs_set_str(h, "ssid",     ap_ssid);
+    nvs_set_str(h, "pass",     ap_pass);
+    nvs_set_str(h, "hostname", s_hostname);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -322,10 +333,6 @@ static void usb_cfg_load(void) {
     uint16_t vid = 0, pid = 0;
     if (nvs_get_u16(h, "vid", &vid) == ESP_OK) s_device_descriptor.idVendor  = vid;
     if (nvs_get_u16(h, "pid", &pid) == ESP_OK) s_device_descriptor.idProduct = pid;
-    int8_t lp = LED_PIN_DEFAULT;
-    if (nvs_get_i8(h, "led_pin", &lp) == ESP_OK) s_led_pin = lp;
-    uint8_t neo = 0;
-    if (nvs_get_u8(h, "led_neo", &neo) == ESP_OK) s_led_neopixel = (neo != 0);
     nvs_close(h);
 }
 
@@ -337,8 +344,34 @@ static void usb_cfg_save(void) {
     nvs_set_str(h, "serial",  s_serial);
     nvs_set_u16(h, "vid",     s_device_descriptor.idVendor);
     nvs_set_u16(h, "pid",     s_device_descriptor.idProduct);
-    nvs_set_i8 (h, "led_pin", (int8_t)s_led_pin);
-    nvs_set_u8 (h, "led_neo", s_led_neopixel ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* ---- Hardware config (LED + WPS button) ---- */
+#define HW_CFG_NS "hw_cfg"
+
+static void hw_cfg_load(void) {
+    nvs_handle_t h;
+    if (nvs_open(HW_CFG_NS, NVS_READONLY, &h) != ESP_OK) return;
+    int8_t lp = LED_PIN_DEFAULT;
+    if (nvs_get_i8(h, "led_pin", &lp) == ESP_OK) s_led_pin = lp;
+    uint8_t neo = 0;
+    if (nvs_get_u8(h, "led_neo", &neo) == ESP_OK) s_led_neopixel = (neo != 0);
+    uint8_t inv = 0;
+    if (nvs_get_u8(h, "led_inv", &inv) == ESP_OK) s_led_invert = (inv != 0);
+    int8_t bp = 0;
+    if (nvs_get_i8(h, "btn_pin", &bp) == ESP_OK) s_btn_pin = bp;
+    nvs_close(h);
+}
+
+static void hw_cfg_save(void) {
+    nvs_handle_t h;
+    if (nvs_open(HW_CFG_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i8(h, "led_pin", (int8_t)s_led_pin);
+    nvs_set_u8(h, "led_neo", s_led_neopixel ? 1 : 0);
+    nvs_set_u8(h, "led_inv", s_led_invert   ? 1 : 0);
+    nvs_set_i8(h, "btn_pin", (int8_t)s_btn_pin);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -564,7 +597,7 @@ static void wifi_manager_task(void *arg){
         uint32_t block_ms = s_scanning ? WIFI_SCAN_TIMEOUT : WIFI_RETRY_MS;
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(block_ms));
 
-        if(s_manual_disconnect || wifi_cred_count == 0){ first=false; s_scan_done=false; s_scanning=false; continue; }
+        if(s_manual_disconnect || s_wps_active || wifi_cred_count == 0){ first=false; s_scan_done=false; s_scanning=false; continue; }
 
         /* Scan timed out without SCAN_DONE — clear flag and fall through to direct connect */
         if(s_scanning && !s_scan_done){
@@ -620,11 +653,68 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_sta_connecting = false;
         sta_ip[0] = 0;
         if(s_suppress_disc > 0){ s_suppress_disc--; return; }
+        if(s_wps_active) return;  /* WPS aborted connection; WPS events will reconnect */
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t*)data;
         printf("STA disconnected reason=%d\n", d ? (int)d->reason : -1);
         if(s_manual_disconnect){ s_manual_disconnect = false; led_cmd(LED_CMD_IDLE); return; }
         led_cmd(LED_CMD_IDLE);
         if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
+    } else if(base == WIFI_EVENT && id == WIFI_EVENT_STA_WPS_ER_SUCCESS){
+        s_wps_active = false;
+        esp_wifi_wps_disable();
+        wifi_config_t sta_cfg = {};
+        if(esp_wifi_get_config(WIFI_IF_STA, &sta_cfg) == ESP_OK && sta_cfg.sta.ssid[0]){
+            printf("WPS: saved SSID=%s\n", sta_cfg.sta.ssid);
+            creds_add((const char*)sta_cfg.sta.ssid, (const char*)sta_cfg.sta.password);
+        }
+        if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
+    } else if(base == WIFI_EVENT && (id == WIFI_EVENT_STA_WPS_ER_FAILED ||
+                                     id == WIFI_EVENT_STA_WPS_ER_TIMEOUT)){
+        s_wps_active = false;
+        esp_wifi_wps_disable();
+        printf("WPS: %s\n", id == WIFI_EVENT_STA_WPS_ER_TIMEOUT ? "timeout" : "failed");
+        led_cmd(s_manual_disconnect ? LED_CMD_IDLE : (sta_connected ? LED_CMD_CONNECTED : LED_CMD_IDLE));
+        if(s_wifi_mgr_task) xTaskNotifyGive(s_wifi_mgr_task);
+    }
+}
+
+static void wps_start_pbc(void) {
+    if (s_wps_active) return;
+    printf("WPS: starting PBC\n");
+    s_wps_active = true;
+    led_cmd(LED_CMD_BOOT);   /* fast blink while searching */
+    esp_wps_config_t wps_cfg = WPS_CONFIG_INIT_DEFAULT(WPS_TYPE_PBC);
+    if (esp_wifi_wps_enable(&wps_cfg) != ESP_OK ||
+        esp_wifi_wps_start() != ESP_OK) {
+        printf("WPS: start failed\n");
+        s_wps_active = false;
+        led_cmd(LED_CMD_IDLE);
+    }
+}
+
+/* Polls a GPIO for a long press (>= 3 s, active-low) and starts WPS PBC mode */
+static void button_task(void *arg) {
+    (void)arg;
+    if (s_btn_pin < 0) { vTaskDelete(NULL); return; }
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << s_btn_pin,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    int held_ms = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (gpio_get_level(s_btn_pin) == 0) {   /* active-low: pressed */
+            held_ms += 50;
+            if (held_ms == 3000) {
+                printf("WPS: long press\n");
+                wps_start_pbc();
+            }
+        } else {
+            held_ms = 0;
+        }
     }
 }
 
@@ -632,7 +722,8 @@ static void wifi_init_ap(void){
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(sta_netif, s_hostname);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
@@ -655,6 +746,7 @@ static void wifi_init_ap(void){
     /* Start WiFi manager task; notify it immediately if we have saved credentials */
     xTaskCreate(wifi_manager_task, "wifi_mgr", 4096, NULL, 4, &s_wifi_mgr_task);
     if(wifi_cred_count > 0) xTaskNotifyGive(s_wifi_mgr_task);
+    xTaskCreate(button_task, "btn", 2048, NULL, 3, NULL);
 }
 
 /* ---- HID keyboard helpers ---- */
@@ -1047,13 +1139,14 @@ static esp_err_t macro_list(httpd_req_t *req){
 static esp_err_t status_get(httpd_req_t *req){
     wifi_sta_list_t sta;
     esp_wifi_ap_get_sta_list(&sta);
-    char out[128];
-    snprintf(out, sizeof(out), "{\"hid\":%s,\"clients\":%d,\"sta\":%s,\"ip\":\"%s\",\"leds\":%d}",
+    char out[160];
+    snprintf(out, sizeof(out), "{\"hid\":%s,\"clients\":%d,\"sta\":%s,\"ip\":\"%s\",\"leds\":%d,\"wps\":%s}",
              hid_enumerated ? "true" : "false",
              sta.num,
              sta_connected ? "true" : "false",
              sta_ip,
-             hid_led_state);
+             hid_led_state,
+             s_wps_active ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
@@ -1213,9 +1306,9 @@ static esp_err_t usb_page_get(httpd_req_t *req) {
 static esp_err_t usb_cfg_get_h(httpd_req_t *req) {
     char out[300];
     snprintf(out, sizeof(out),
-             "{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\",\"led_pin\":%d,\"led_neo\":%d}",
+             "{\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"mfr\":\"%s\",\"product\":\"%s\",\"serial\":\"%s\"}",
              s_device_descriptor.idVendor, s_device_descriptor.idProduct,
-             s_manufacturer, s_product, s_serial, s_led_pin, s_led_neopixel ? 1 : 0);
+             s_manufacturer, s_product, s_serial);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
@@ -1228,15 +1321,11 @@ static void usb_cfg_apply(char *buf) {
     char *mfr_s  = strtok_r(NULL, "|", &sp);
     char *prod_s = strtok_r(NULL, "|", &sp);
     char *ser_s  = strtok_r(NULL, "|", &sp);
-    char *led_s  = strtok_r(NULL, "|", &sp);
-    char *neo_s  = strtok_r(NULL, "|", &sp);
     if (vid_s)  s_device_descriptor.idVendor  = (uint16_t)strtol(vid_s, NULL, 16);
     if (pid_s)  s_device_descriptor.idProduct = (uint16_t)strtol(pid_s, NULL, 16);
     if (mfr_s)  strncpy(s_manufacturer, mfr_s,  sizeof(s_manufacturer)-1);
     if (prod_s) strncpy(s_product,      prod_s,  sizeof(s_product)-1);
     if (ser_s)  strncpy(s_serial,       ser_s,   sizeof(s_serial)-1);
-    if (led_s)  s_led_pin      = atoi(led_s);
-    if (neo_s)  s_led_neopixel = (atoi(neo_s) != 0);
     usb_cfg_save();
 }
 
@@ -1258,8 +1347,9 @@ static esp_err_t usb_cfg_save_h(httpd_req_t *req) {
 }
 
 static esp_err_t ap_cfg_get_h(httpd_req_t *req) {
-    char out[128];
-    snprintf(out, sizeof(out), "{\"ssid\":\"%s\",\"pass\":\"%s\"}", ap_ssid, ap_pass);
+    char out[256];
+    snprintf(out, sizeof(out), "{\"ssid\":\"%s\",\"pass\":\"%s\",\"hostname\":\"%s\"}",
+             ap_ssid, ap_pass, s_hostname);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, out);
     return ESP_OK;
@@ -1270,22 +1360,123 @@ static esp_err_t ap_cfg_post_h(httpd_req_t *req) {
     int len = httpd_req_recv(req, buf, sizeof(buf)-1);
     if (len < 0) len = 0;
     buf[len] = 0;
-    /* format: ssid|password */
+    /* format: ssid|password|hostname */
     char *sp;
     char *ssid_s = strtok_r(buf,  "|", &sp);
     char *pass_s = strtok_r(NULL, "|", &sp);
-    if (ssid_s) strncpy(ap_ssid, ssid_s, sizeof(ap_ssid)-1);
-    if (pass_s) strncpy(ap_pass, pass_s, sizeof(ap_pass)-1);
+    char *host_s = strtok_r(NULL, "|", &sp);
+    if (ssid_s) strncpy(ap_ssid,    ssid_s, sizeof(ap_ssid)-1);
+    if (pass_s) strncpy(ap_pass,    pass_s, sizeof(ap_pass)-1);
+    if (host_s && host_s[0]) strncpy(s_hostname, host_s, sizeof(s_hostname)-1);
     ap_cfg_save();
     httpd_resp_sendstr(req, "OK");
     schedule_restart();
     return ESP_OK;
 }
 
+/* ---- hardware monitor ---- */
+static temperature_sensor_handle_t s_temp_sensor = NULL;
+static adc_oneshot_unit_handle_t   s_adc1_handle  = NULL;
+
+static const int s_valid_gpios[] = {
+    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,
+    26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48
+};
+#define VALID_GPIO_COUNT ((int)(sizeof(s_valid_gpios)/sizeof(s_valid_gpios[0])))
+
+static void hw_monitor_init(void) {
+    temperature_sensor_config_t tsens_cfg = {
+        .range_min = -10, .range_max = 80
+    };
+    if (temperature_sensor_install(&tsens_cfg, &s_temp_sensor) == ESP_OK)
+        temperature_sensor_enable(s_temp_sensor);
+
+    adc_oneshot_unit_init_cfg_t adc_cfg = { .unit_id = ADC_UNIT_1 };
+    if (adc_oneshot_new_unit(&adc_cfg, &s_adc1_handle) == ESP_OK) {
+        adc_oneshot_chan_cfg_t ch_cfg = {
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+            .atten    = ADC_ATTEN_DB_12
+        };
+        for (int ch = 0; ch <= 9; ch++)
+            adc_oneshot_config_channel(s_adc1_handle, (adc_channel_t)ch, &ch_cfg);
+    }
+}
+
+static esp_err_t hw_status_get(httpd_req_t *req) {
+    float temp_c = 0.0f;
+    if (s_temp_sensor) temperature_sensor_get_celsius(s_temp_sensor, &temp_c);
+
+    char buf[512];
+    int pos = snprintf(buf, sizeof(buf), "{\"temp\":%.1f,\"gpio\":[", temp_c);
+    for (int i = 0; i < VALID_GPIO_COUNT; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        i ? ",%d" : "%d", gpio_get_level(s_valid_gpios[i]));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"adc\":[");
+    for (int ch = 0; ch <= 9; ch++) {
+        int raw = 0;
+        if (s_adc1_handle) adc_oneshot_read(s_adc1_handle, (adc_channel_t)ch, &raw);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, ch ? ",%d" : "%d", raw);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t hw_page_get(httpd_req_t *req) {
+    return send_html_versioned(req, hw_html_start, hw_html_end);
+}
+
+static esp_err_t hw_cfg_get_h(httpd_req_t *req) {
+    char out[128];
+    snprintf(out, sizeof(out),
+             "{\"led_pin\":%d,\"led_neo\":%d,\"led_inv\":%d,\"btn_pin\":%d}",
+             s_led_pin, s_led_neopixel ? 1 : 0, s_led_invert ? 1 : 0, s_btn_pin);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+static void hw_cfg_apply(char *buf) {
+    char *sp;
+    char *led_s = strtok_r(buf,  "|", &sp);
+    char *neo_s = strtok_r(NULL, "|", &sp);
+    char *inv_s = strtok_r(NULL, "|", &sp);
+    char *btn_s = strtok_r(NULL, "|", &sp);
+    if (led_s) s_led_pin      = atoi(led_s);
+    if (neo_s) s_led_neopixel = (atoi(neo_s) != 0);
+    if (inv_s) s_led_invert   = (atoi(inv_s) != 0);
+    if (btn_s) s_btn_pin      = atoi(btn_s);
+    hw_cfg_save();
+}
+
+static esp_err_t hw_cfg_post_h(httpd_req_t *req) {
+    char buf[64];
+    recv_body(req, buf, sizeof(buf));
+    hw_cfg_apply(buf);
+    httpd_resp_sendstr(req, "OK");
+    schedule_restart();
+    return ESP_OK;
+}
+
+static esp_err_t hw_cfg_save_h(httpd_req_t *req) {
+    char buf[64];
+    recv_body(req, buf, sizeof(buf));
+    hw_cfg_apply(buf);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t wifi_wps_post(httpd_req_t *req) {
+    wps_start_pbc();
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static void web_start(void){
     httpd_handle_t server=NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 26;
+    cfg.max_uri_handlers = 30;
     httpd_start(&server,&cfg);
 
     httpd_uri_t u1={.uri="/",.method=HTTP_GET,.handler=root_get};
@@ -1310,6 +1501,12 @@ static void web_start(void){
     httpd_uri_t u16={.uri="/ap/config",.method=HTTP_GET,.handler=ap_cfg_get_h};
     httpd_uri_t u17={.uri="/ap/config",.method=HTTP_POST,.handler=ap_cfg_post_h};
     httpd_uri_t u18={.uri="/help",.method=HTTP_GET,.handler=help_page_get};
+    httpd_uri_t u19={.uri="/wifi/wps",.method=HTTP_POST,.handler=wifi_wps_post};
+    httpd_uri_t u20={.uri="/hw",.method=HTTP_GET,.handler=hw_page_get};
+    httpd_uri_t u21={.uri="/hw/config",.method=HTTP_GET,.handler=hw_cfg_get_h};
+    httpd_uri_t u22={.uri="/hw/config",.method=HTTP_POST,.handler=hw_cfg_post_h};
+    httpd_uri_t u23={.uri="/hw/config/save",.method=HTTP_POST,.handler=hw_cfg_save_h};
+    httpd_uri_t u24={.uri="/hw/status",.method=HTTP_GET,.handler=hw_status_get};
 
     httpd_register_uri_handler(server,&u1);
     httpd_register_uri_handler(server,&u2);
@@ -1333,6 +1530,12 @@ static void web_start(void){
     httpd_register_uri_handler(server,&u16);
     httpd_register_uri_handler(server,&u17);
     httpd_register_uri_handler(server,&u18);
+    httpd_register_uri_handler(server,&u19);
+    httpd_register_uri_handler(server,&u20);
+    httpd_register_uri_handler(server,&u21);
+    httpd_register_uri_handler(server,&u22);
+    httpd_register_uri_handler(server,&u23);
+    httpd_register_uri_handler(server,&u24);
 }
 
 static void usb_hid_init(void) {
@@ -1354,6 +1557,7 @@ void app_main(void){
     }
     ap_cfg_load();
     usb_cfg_load();
+    hw_cfg_load();
     macros_load();
 
     /* LED task starts immediately in boot-blink mode */
@@ -1364,6 +1568,7 @@ void app_main(void){
     s_hid_queue = xQueueCreate(HID_QUEUE_DEPTH, sizeof(hid_cmd_t));
     xTaskCreate(hid_worker_task, "hid_worker", 4096, NULL, 5, NULL);
 
+    hw_monitor_init();
     usb_hid_init();
     wifi_init_ap();
     web_start();

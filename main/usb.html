@@ -20,8 +20,6 @@ button{margin:4px;padding:8px}
 <label>Manufacturer<input id="mfr" type="text" placeholder="Manufacturer"></label>
 <label>Product<input id="product" type="text" placeholder="Product name"></label>
 <label>Serial Number<input id="serial" type="text" placeholder="Serial number"></label>
-<label>LED GPIO Pin (-1 to disable)<input id="led_pin" type="text" placeholder="-1"></label>
-<label style="display:flex;align-items:center;gap:6px;margin:4px 0"><input id="led_neo" type="checkbox" style="width:auto"> NeoPixel (WS2812) on that pin</label>
 <br>
 <button onclick="save(true)">Save &amp; Restart</button>
 <button onclick="save(false)">Save</button>
@@ -36,8 +34,6 @@ async function load(){
   document.getElementById('mfr').value=j.mfr||'';
   document.getElementById('product').value=j.product||'';
   document.getElementById('serial').value=j.serial||'';
-  document.getElementById('led_pin').value=(j.led_pin!==undefined)?j.led_pin:-1;
-  document.getElementById('led_neo').checked=!!j.led_neo;
  }catch(e){document.getElementById('msg').textContent='Load failed.';}
 }
 async function save(restart){
@@ -46,13 +42,11 @@ async function save(restart){
  const mfr=document.getElementById('mfr').value;
  const product=document.getElementById('product').value;
  const serial=document.getElementById('serial').value;
- const led_pin=document.getElementById('led_pin').value.trim()||'-1';
- const led_neo=document.getElementById('led_neo').checked?'1':'0';
  const msg=document.getElementById('msg');
  if(!vid||!pid){msg.textContent='VID and PID required.';return;}
  msg.textContent='Saving\u2026';
  const url=restart?'/usb/config':'/usb/config/save';
- await fetch(url,{method:'POST',body:vid+'|'+pid+'|'+mfr+'|'+product+'|'+serial+'|'+led_pin+'|'+led_neo});
+ await fetch(url,{method:'POST',body:vid+'|'+pid+'|'+mfr+'|'+product+'|'+serial});
  msg.textContent=restart?'Saved \u2013 restarting\u2026':'Saved.';
 }
 load();

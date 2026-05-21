@@ -180,19 +180,41 @@ any entry there.</p>
   <tr><td>Manufacturer</td><td>Manufacturer string shown in device manager.</td></tr>
   <tr><td>Product</td><td>Product name string shown in device manager.</td></tr>
   <tr><td>Serial Number</td><td>Serial number string.</td></tr>
-  <tr><td>LED GPIO Pin</td><td>GPIO pin number for a status LED. Set to <code>-1</code> to disable.</td></tr>
-  <tr><td>NeoPixel (WS2812)</td><td>When checked, the LED pin is driven with the WS2812 protocol via RMT instead of plain GPIO.</td></tr>
 </table>
+</div>
 
-<h4>LED / NeoPixel status colours</h4>
+<div class="card">
+<h3>Hardware settings</h3>
+<p>Accessible from <a href="/hw">Hardware</a>. Changes take effect after restart.</p>
+
+<h4>Status LED</h4>
 <table>
+  <tr><th>Field</th><th>Description</th></tr>
+  <tr><td>GPIO Pin</td><td>GPIO number for a status LED. <code>-1</code> = disabled.</td></tr>
+  <tr><td>NeoPixel (WS2812)</td><td>Drive the pin with WS2812 protocol via RMT instead of plain GPIO.</td></tr>
+  <tr><td>Invert (active-low)</td><td>Flip the GPIO level — use when the LED is connected between GPIO and VCC.</td></tr>
+</table>
+<table style="margin-top:6px">
   <tr><th>State</th><th>Plain LED</th><th>NeoPixel colour</th></tr>
-  <tr><td>Booting</td><td>2 Hz blink</td><td>Blue blink</td></tr>
+  <tr><td>Booting / WPS active</td><td>2 Hz blink</td><td>Blue blink</td></tr>
   <tr><td>Idle (no Wi-Fi)</td><td>Off</td><td>Off</td></tr>
   <tr><td>Wi-Fi connected</td><td>Steady on</td><td>Steady green</td></tr>
   <tr><td>Connecting (flash)</td><td>0.7 s pulse</td><td>0.7 s yellow pulse</td></tr>
   <tr><td>Key being sent</td><td>Brief invert</td><td>Brief red flash</td></tr>
 </table>
+
+<h4>WPS Button</h4>
+<table>
+  <tr><th>Field</th><th>Description</th></tr>
+  <tr><td>GPIO Pin</td><td>GPIO for the WPS push-button. Default <code>0</code> (built-in BOOT button). <code>-1</code> = disabled.</td></tr>
+</table>
+<p>WPS can be triggered two ways:</p>
+<ul>
+  <li><strong>Hardware button:</strong> hold the configured GPIO low for <strong>3 seconds</strong>. The LED will fast-blink while searching.</li>
+  <li><strong>Web button:</strong> click <strong>WPS</strong> on the <a href="/wifi">Wi-Fi Settings</a> page (next to Disconnect). The button disables itself and a status label appears while WPS is active.</li>
+</ul>
+<p>Once WPS completes the router's credentials are saved and the device connects automatically.
+The LED returns to normal state when WPS succeeds or times out (~2 min).</p>
 </div>
 
 </body>

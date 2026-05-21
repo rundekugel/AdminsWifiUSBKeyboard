@@ -25,7 +25,9 @@ button{margin:4px;padding:8px}
 
 <div class="card">
 <p><span class="st-dot" id="dot_sta"></span><strong>STA:</strong> <span id="st_sta">…</span>
-&nbsp;<button onclick="disconnect()" style="font-size:0.8em;padding:4px 8px">Disconnect</button></p>
+&nbsp;<button onclick="disconnect()" style="font-size:0.8em;padding:4px 8px">Disconnect</button>
+&nbsp;<button onclick="startWps()" id="wps_btn" style="font-size:0.8em;padding:4px 8px">WPS</button>
+&nbsp;<span id="wps_status" style="font-size:0.85em;color:#a60;display:none">⏳ WPS searching…</span></p>
 </div>
 
 <div class="card">
@@ -53,6 +55,7 @@ button{margin:4px;padding:8px}
 <h3>Access Point</h3>
 <label>SSID<input id="ap_ssid" type="text" placeholder="AP name"></label>
 <label>Password (min 8 chars, empty=open)<input id="ap_pass" type="text" placeholder="AP password"></label>
+<label>Hostname (mDNS / DHCP)<input id="ap_host" type="text" placeholder="adminkbd"></label>
 <br>
 <button onclick="saveApCfg()">Save &amp; Restart</button>
 <span id="ap_msg" style="font-size:0.85em;margin-left:8px"></span>
@@ -115,6 +118,10 @@ async function deleteIdx(idx){
 async function disconnect(){
  await fetch('/wifi/disconnect',{method:'POST',body:''});
 }
+async function startWps(){
+ document.getElementById('wps_btn').disabled=true;
+ await fetch('/wifi/wps',{method:'POST',body:''});
+}
 async function moveNet(idx,dir){
  await fetch('/wifi/move',{method:'POST',body:idx+'|'+dir});
  loadNetworks();
@@ -146,6 +153,8 @@ async function pollStatus(){
   const j=await (await fetch('/status')).json();
   document.getElementById('st_sta').textContent=j.sta?(j.ip||'connected'):'Not connected';
   document.getElementById('dot_sta').className='st-dot '+(j.sta?'on':'off');
+  document.getElementById('wps_status').style.display=j.wps?'inline':'none';
+  document.getElementById('wps_btn').disabled=!!j.wps;
  }catch(e){
   document.getElementById('st_sta').textContent='?';
  }
@@ -155,15 +164,17 @@ async function loadApCfg(){
   const j=await (await fetch('/ap/config')).json();
   document.getElementById('ap_ssid').value=j.ssid||'';
   document.getElementById('ap_pass').value=j.pass||'';
+  document.getElementById('ap_host').value=j.hostname||'';
  }catch(e){}
 }
 async function saveApCfg(){
  const ssid=document.getElementById('ap_ssid').value.trim();
  const pass=document.getElementById('ap_pass').value;
+ const host=document.getElementById('ap_host').value.trim();
  const msg=document.getElementById('ap_msg');
  if(!ssid){msg.textContent='SSID required.';return;}
  msg.textContent='Saving…';
- await fetch('/ap/config',{method:'POST',body:ssid+'|'+pass});
+ await fetch('/ap/config',{method:'POST',body:ssid+'|'+pass+'|'+host});
  msg.textContent='Saved – restarting…';
 }
 loadNetworks();

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Admin-Keyboard – Hardware V%%VERSION%%</title>
+<style>
+body{font-family:Arial;margin:20px}
+input{width:100%;margin:4px 0;box-sizing:border-box;padding:6px}
+button{margin:4px;padding:8px}
+.card{border:1px solid #ccc;padding:10px;margin:8px 0}
+.cb{display:flex;align-items:center;gap:6px;margin:4px 0}
+.cb input{width:auto}
+#msg{margin-top:8px;font-size:0.9em}
+.gpio-grid{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0}
+.gpio-pin{display:inline-flex;flex-direction:column;align-items:center;width:42px;padding:3px 2px;border-radius:4px;font-size:0.75em;border:1px solid #ccc;cursor:default}
+.gpio-pin.hi{background:#c8ffc8;border-color:#4a4}
+.gpio-pin.lo{background:#eee;border-color:#bbb;color:#888}
+table.adc-tbl{border-collapse:collapse;width:100%;margin:6px 0}
+table.adc-tbl th{background:#f0f0f0;text-align:left}
+table.adc-tbl th,table.adc-tbl td{border:1px solid #ccc;padding:4px 7px;font-size:0.88em}
+</style>
+</head>
+<body>
+<p><a href="/">&larr; Back</a></p>
+<h2>Hardware Settings V%%VERSION%%</h2>
+
+<div class="card">
+<h3>Status LED</h3>
+<label>GPIO Pin (-1 to disable)<input id="led_pin" type="text" placeholder="-1"></label>
+<label class="cb"><input id="led_neo" type="checkbox"> NeoPixel / WS2812 on that pin</label>
+<label class="cb"><input id="led_inv" type="checkbox"> Invert output (active-low)</label>
+</div>
+
+<div class="card">
+<h3>WPS Button</h3>
+<label>GPIO Pin (-1 to disable)<input id="btn_pin" type="text" placeholder="0"></label>
+<p style="font-size:0.85em;color:#666;margin:4px 0">Hold 3 s to start WPS PBC pairing. GPIO 0 = built-in BOOT button.</p>
+</div>
+
+<button onclick="save(true)">Save &amp; Restart</button>
+<button onclick="save(false)">Save</button>
+<span id="msg"></span>
+
+<div class="card">
+<h3>Monitor</h3>
+<p><strong>Temperature:</strong> <span id="mon_temp">…</span></p>
+<h4>GPIO states</h4>
+<div id="mon_gpio" class="gpio-grid"></div>
+<h4>ADC1 readings</h4>
+<table class="adc-tbl">
+ <tr><th>Channel</th><th>GPIO</th><th>Raw (0–4095)</th><th>Voltage (mV)</th></tr>
+ <tbody id="mon_adc"></tbody>
+</table>
+</div>
+
+<script>
+const GPIO_LIST=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,
+                 26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48];
+const ADC_GPIOS=[1,2,3,4,5,6,7,8,9,10]; // ADC1 ch0-ch9 → GPIO1-10
+
+async function pollMonitor(){
+ try{
+  const j=await (await fetch('/hw/status')).json();
+  document.getElementById('mon_temp').textContent=j.temp.toFixed(1)+' °C';
+  const gDiv=document.getElementById('mon_gpio');
+  if(!gDiv.children.length){
+   GPIO_LIST.forEach((g,i)=>{
+    const el=document.createElement('div');
+    el.className='gpio-pin';
+    el.id='gp'+g;
+    el.innerHTML='<span style="font-weight:bold">'+g+'</span><span class="gpio-lv">?</span>';
+    gDiv.appendChild(el);
+   });
+  }
+  j.gpio.forEach((v,i)=>{
+   const el=document.getElementById('gp'+GPIO_LIST[i]);
+   if(!el) return;
+   el.className='gpio-pin '+(v?'hi':'lo');
+   el.querySelector('.gpio-lv').textContent=v?'H':'L';
+  });
+  const tbody=document.getElementById('mon_adc');
+  tbody.innerHTML='';
+  j.adc.forEach((raw,ch)=>{
+   const mv=Math.round(raw/4095*3300);
+   const tr=document.createElement('tr');
+   tr.innerHTML='<td>'+ch+'</td><td>'+ADC_GPIOS[ch]+'</td><td>'+raw+'</td><td>'+mv+'</td>';
+   tbody.appendChild(tr);
+  });
+ }catch(e){}
+}
+
+async function load(){
+ try{
+  const j=await (await fetch('/hw/config')).json();
+  document.getElementById('led_pin').value=j.led_pin??-1;
+  document.getElementById('led_neo').checked=!!j.led_neo;
+  document.getElementById('led_inv').checked=!!j.led_inv;
+  document.getElementById('btn_pin').value=j.btn_pin??0;
+ }catch(e){document.getElementById('msg').textContent='Load failed.';}
+}
+async function save(restart){
+ const led_pin=document.getElementById('led_pin').value.trim()||'-1';
+ const led_neo=document.getElementById('led_neo').checked?'1':'0';
+ const led_inv=document.getElementById('led_inv').checked?'1':'0';
+ const btn_pin=document.getElementById('btn_pin').value.trim()||'-1';
+ const msg=document.getElementById('msg');
+ msg.textContent='Saving\u2026';
+ const url=restart?'/hw/config':'/hw/config/save';
+ await fetch(url,{method:'POST',body:led_pin+'|'+led_neo+'|'+led_inv+'|'+btn_pin});
+ msg.textContent=restart?'Saved \u2013 restarting\u2026':'Saved.';
+}
+load();
+setInterval(pollMonitor,2000);
+pollMonitor();
+</script>
+</body>
+</html>
