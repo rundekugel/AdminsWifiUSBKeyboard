@@ -10,12 +10,22 @@ button{margin:4px;padding:8px}
 .card{border:1px solid #ccc;padding:10px;margin:8px 0}
 .cb{display:flex;align-items:center;gap:6px;margin:4px 0}
 .cb input{width:auto}
+#statusBar{display:flex;gap:16px;flex-wrap:wrap;padding:6px 10px;background:#f0f0f0;border-radius:4px;margin-bottom:8px;font-size:0.9em}
+.st-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#ccc;margin-right:4px;vertical-align:middle}
+.st-dot.on{background:#2a2}
+.st-dot.off{background:#c44}
 #msg{margin-top:8px;font-size:0.9em}
 
 </style>
 </head>
 <body>
-<p><a href="/">&#8592; Home</a> &nbsp;|&nbsp; <a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/help">&#63; Help</a></p>
+<p><a href="/">&#8592; Home</a> &nbsp;|&nbsp; <a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/ota">&#11014; Firmware</a> &nbsp; <a href="/help">&#63; Help</a></p>
+<div id="statusBar">
+  <span><span class="st-dot" id="dot_hid"></span><strong>USB HID:</strong> <span id="st_hid">…</span></span>
+  <span><span class="st-dot" id="dot_wifi"></span><strong>WiFi Clients:</strong> <span id="st_clients">…</span></span>
+  <span><span class="st-dot" id="dot_sta"></span><strong>WiFi STA:</strong> <span id="st_sta">…</span></span>
+  <span><span class="st-dot" id="dot_web"></span><strong>Web Clients:</strong> <span id="st_web">…</span></span>
+</div>
 <h2>Hardware Settings V%%VERSION%%</h2>
 
 <div class="card">
@@ -57,6 +67,21 @@ async function save(restart){
  msg.textContent=restart?'Saved \u2013 restarting\u2026':'Saved.';
 }
 load();
+async function pollStatus(){
+ try{
+  const j=await (await fetch('/status')).json();
+  document.getElementById('st_hid').textContent=j.hid?'Enumerated':'Not connected';
+  document.getElementById('dot_hid').className='st-dot '+(j.hid?'on':'off');
+  document.getElementById('st_clients').textContent=j.clients;
+  document.getElementById('dot_wifi').className='st-dot '+(j.clients>0?'on':'off');
+  document.getElementById('st_sta').textContent=j.sta?(j.ip||'connected'):'Not connected';
+  document.getElementById('dot_sta').className='st-dot '+(j.sta?'on':'off');
+  document.getElementById('st_web').textContent=j.web_clients;
+  document.getElementById('dot_web').className='st-dot '+(j.web_clients>0?'on':'off');
+ }catch(e){}
+}
+setInterval(pollStatus,2000);
+pollStatus();
 </script>
 </body>
 </html>

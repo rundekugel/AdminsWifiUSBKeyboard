@@ -22,7 +22,7 @@ button{margin:4px;padding:8px}
 </head>
 <body>
 <h2>Admin-Keyboard Console V%%VERSION%%</h2>
-<p><a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/help">&#63; Help</a></p>
+<p><a href="/wifi">&#9881; WiFi Settings</a> &nbsp; <a href="/usb">&#128279; USB Device</a> &nbsp; <a href="/hw">&#9881;&#9082; Hardware</a> &nbsp; <a href="/monitor">&#128202; Monitor</a> &nbsp; <a href="/ota">&#11014; Firmware</a> &nbsp; <a href="/help">&#63; Help</a></p>
 <div id="usbBanner">&#9888; USB HID not connected — keystrokes will not be sent</div>
 <div id="statusBar">
   <span><span class="st-dot" id="dot_hid"></span><strong>USB HID:</strong> <span id="st_hid">…</span></span>
@@ -69,6 +69,7 @@ button{margin:4px;padding:8px}
 
 <div class="card">
 <h3>Save Macro</h3>
+<p>Be sure, this is encrypted and password protected, before you store passwords here!</p>
 <input id="macro_name" placeholder="Macro Name">
 <textarea id="macro_body" rows="8">STRING hello
 KEY ENTER</textarea>
@@ -78,6 +79,28 @@ KEY ENTER</textarea>
 <div class="card">
 <h3>Macros</h3>
 <div id="list"></div>
+<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+ <button onclick="exportMacros()">Export JSON</button>
+ <label style="display:flex;align-items:center;gap:4px;font-size:0.9em">
+  Import: <input type="file" id="macro_file" accept=".json" style="width:auto;margin:0">
+ </label>
+ <button onclick="importMacros()">Import</button>
+ <span id="macro_io_msg" style="font-size:0.85em"></span>
+</div>
+</div>
+
+<div class="card">
+<h3>Backup &amp; Restore</h3>
+<p style="font-size:0.9em;margin:4px 0">Exports all settings: macros, AP config, USB config, hardware config and saved WiFi networks.
+Importing restores all of these and saves to flash (restart required for AP/USB/HW changes to take effect).</p>
+<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+ <button onclick="exportAll()">Export All Settings</button>
+ <label style="display:flex;align-items:center;gap:4px;font-size:0.9em">
+  Restore: <input type="file" id="settings_file" accept=".json" style="width:auto;margin:0">
+ </label>
+ <button onclick="importAll()">Import &amp; Apply</button>
+ <span id="settings_io_msg" style="font-size:0.85em"></span>
+</div>
 </div>
 
 <script>
@@ -248,6 +271,43 @@ async function load(){
  });
 }
 load();
+
+function exportMacros(){
+ const a=document.createElement('a');
+ a.href='/macro/export';
+ a.download='macros.json';
+ a.click();
+}
+async function importMacros(){
+ const f=document.getElementById('macro_file').files[0];
+ const msg=document.getElementById('macro_io_msg');
+ if(!f){msg.textContent='Select a file first.';return;}
+ msg.textContent='Importing…';
+ const text=await f.text();
+ const r=await fetch('/macro/import',{method:'POST',body:text});
+ const ok=await r.text();
+ msg.textContent=ok==='OK'?'Done.':'Error: '+ok;
+ load();
+}
+
+function exportAll(){
+ const a=document.createElement('a');
+ a.href='/settings/export';
+ a.download='adminkbd-backup.json';
+ a.click();
+}
+async function importAll(){
+ const f=document.getElementById('settings_file').files[0];
+ const msg=document.getElementById('settings_io_msg');
+ if(!f){msg.textContent='Select a file first.';return;}
+ if(!confirm('This will overwrite all current settings. Continue?')) return;
+ msg.textContent='Importing…';
+ const text=await f.text();
+ const r=await fetch('/settings/import',{method:'POST',body:text});
+ const ok=await r.text();
+ msg.textContent=ok==='OK'?'Done – restart to apply AP/USB/HW changes.':'Error: '+ok;
+ load();
+}
 </script>
 </body>
 </html>
