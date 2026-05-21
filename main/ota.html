@@ -29,8 +29,8 @@ button{margin:4px;padding:8px}
 
 <div class="card">
 <h3>Upload firmware</h3>
-<p class="note">Select the <strong>.bin</strong> file produced by <code>idf.py build</code> (<code>build/esp32_dual_target_macro_web.bin</code>). The device will reboot automatically after a successful upload.</p>
-<input type="file" id="bin_file" accept=".bin">
+<p class="note">Select the <strong>encrypted .bin.enc</strong> file produced by <code>tools/encrypt_firmware.py</code>. The device verifies the SHA-256 hash and AES-256 key before flashing — an incorrect or unencrypted file will be rejected. The device reboots automatically after a successful upload.</p>
+<input type="file" id="bin_file" accept=".enc,.bin">
 <br>
 <button id="upload_btn" onclick="startUpload()" style="margin-top:8px">Upload &amp; Flash</button>
 <div id="prog-wrap"><div id="prog-bar"></div></div>
@@ -38,6 +38,10 @@ button{margin:4px;padding:8px}
 </div>
 
 <script>
+let pollTimer=null;
+function startPolling(){ pollTimer=setInterval(pollStatus,2000); }
+function stopPolling(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
+
 async function startUpload(){
  const file=document.getElementById('bin_file').files[0];
  if(!file){alert('Select a .bin file first.');return;}
@@ -49,6 +53,7 @@ async function startUpload(){
  wrap.style.display='block';
  bar.style.width='0%';
  status.textContent='Uploading…';
+ stopPolling();  /* avoid competing connections during upload */
  const xhr=new XMLHttpRequest();
  xhr.upload.onprogress=e=>{
   if(e.lengthComputable){
@@ -66,12 +71,14 @@ async function startUpload(){
    bar.style.background='#c44';
    status.textContent='Error: '+xhr.responseText;
    btn.disabled=false;
+   startPolling();
   }
  };
  xhr.onerror=()=>{
   bar.style.background='#c44';
   status.textContent='Upload failed (connection error)';
   btn.disabled=false;
+  startPolling();
  };
  xhr.open('POST','/ota/upload');
  xhr.setRequestHeader('Content-Type','application/octet-stream');
@@ -90,7 +97,7 @@ async function pollStatus(){
   document.getElementById('dot_web').className='st-dot '+(j.web_clients>0?'on':'off');
  }catch(e){}
 }
-setInterval(pollStatus,2000);
+startPolling();
 pollStatus();
 </script>
 </body>

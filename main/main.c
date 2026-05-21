@@ -18,6 +18,9 @@
 #include "driver/temperature_sensor.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_ota_ops.h"
+#include "aes/esp_aes.h"
+#include "psa/crypto.h"
+#include "credentials.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "class/hid/hid_device.h"
@@ -37,7 +40,7 @@ extern const unsigned char monitor_html_end[]   asm("_binary_monitor_html_end");
 extern const unsigned char ota_html_start[]     asm("_binary_ota_html_start");
 extern const unsigned char ota_html_end[]       asm("_binary_ota_html_end");
 
-#define VERSION "0.4.3"
+#define VERSION "0.5.0b"
 #define REVISION 0
 
 typedef struct {
@@ -1587,30 +1590,112 @@ static esp_err_t ota_page_get(httpd_req_t *req) {
     return send_html_versioned(req, ota_html_start, ota_html_end);
 }
 
+/* OTA upload: file format = SHA-256(IV||ciphertext)[32] + IV[16] + AES-256-CBC(firmware+PKCS7) */
 static esp_err_t ota_upload_post(httpd_req_t *req) {
+    static uint8_t recv_buf[4096];
+
+    /* ---- receive 48-byte header: digest(32) + IV(16) ---- */
+    uint8_t expected_hash[32], iv[16];
+    {
+        uint8_t hdr[48]; int got = 0;
+        while (got < 48) {
+            int n = httpd_req_recv(req, (char *)(hdr + got), 48 - got);
+            if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            if (n <= 0) {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Header recv failed");
+                return ESP_FAIL;
+            }
+            got += n;
+        }
+        memcpy(expected_hash, hdr,      32);
+        memcpy(iv,            hdr + 32, 16);
+    }
+
+    int enc_remaining = req->content_len - 48;
+    if (enc_remaining <= 0 || (enc_remaining & 15) != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid payload length");
+        return ESP_FAIL;
+    }
+
+    /* ---- init AES-256-CBC decrypt + SHA-256 over (IV || ciphertext) ---- */
+    const uint8_t key[] = OTA_AES_KEY;
+    esp_aes_context aes; esp_aes_init(&aes);
+    esp_aes_setkey(&aes, key, 256);
+    psa_crypto_init();
+    psa_hash_operation_t sha = PSA_HASH_OPERATION_INIT;
+    psa_hash_setup(&sha, PSA_ALG_SHA_256);
+    psa_hash_update(&sha, iv, 16);
+
+    /* ---- OTA begin ---- */
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
+        esp_aes_free(&aes); psa_hash_abort(&sha);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
         return ESP_FAIL;
     }
     esp_ota_handle_t ota = 0;
     if (esp_ota_begin(part, OTA_SIZE_UNKNOWN, &ota) != ESP_OK) {
+        esp_aes_free(&aes); psa_hash_abort(&sha);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
         return ESP_FAIL;
     }
-    char buf[4096];
-    int remaining = req->content_len;
-    while (remaining > 0) {
-        int n = httpd_req_recv(req, buf, remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf));
+
+    /* ---- stream: hash ciphertext, decrypt block-by-block, write to OTA ----
+       The last decrypted block is held back so PKCS#7 padding can be stripped. */
+    uint8_t cbc_iv[16]; memcpy(cbc_iv, iv, 16);
+    uint8_t pend[16];   int pend_n = 0;      /* partial ciphertext block accumulator */
+    uint8_t held[16];   bool have_held = false; /* last decrypted block (pending write) */
+    bool    stream_ok   = true;
+
+    while (enc_remaining > 0) {
+        int to_recv = enc_remaining < (int)sizeof(recv_buf) ? enc_remaining : (int)sizeof(recv_buf);
+        int n = httpd_req_recv(req, (char *)recv_buf, to_recv);
         if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
-        if (n <= 0) { esp_ota_abort(ota); return ESP_FAIL; }
-        if (esp_ota_write(ota, buf, n) != ESP_OK) {
-            esp_ota_abort(ota);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
-            return ESP_FAIL;
+        if (n <= 0) { stream_ok = false; break; }
+
+        psa_hash_update(&sha, recv_buf, n);
+        enc_remaining -= n;
+
+        for (int src = 0; src < n && stream_ok; ) {
+            int take = n - src < 16 - pend_n ? n - src : 16 - pend_n;
+            memcpy(pend + pend_n, recv_buf + src, take);
+            pend_n += take; src += take;
+            if (pend_n == 16) {
+                uint8_t dec[16];
+                esp_aes_crypt_cbc(&aes, ESP_AES_DECRYPT, 16, cbc_iv, pend, dec);
+                if (have_held && esp_ota_write(ota, held, 16) != ESP_OK)
+                    stream_ok = false;
+                memcpy(held, dec, 16); have_held = true; pend_n = 0;
+            }
         }
-        remaining -= n;
     }
+
+    /* ---- verify SHA-256 hash ---- */
+    uint8_t actual_hash[32]; size_t actual_hash_len;
+    psa_hash_finish(&sha, actual_hash, sizeof(actual_hash), &actual_hash_len);
+    esp_aes_free(&aes);
+
+    if (!stream_ok || !have_held || memcmp(expected_hash, actual_hash, 32) != 0) {
+        esp_ota_abort(ota);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            stream_ok ? "Hash mismatch — wrong key or corrupted file" : "Receive error");
+        return ESP_FAIL;
+    }
+
+    /* ---- strip PKCS#7 padding from last block, write remainder ---- */
+    int pad = held[15];
+    if (pad < 1 || pad > 16) {
+        esp_ota_abort(ota);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad padding");
+        return ESP_FAIL;
+    }
+    if (pad < 16 && esp_ota_write(ota, held, 16 - pad) != ESP_OK) {
+        esp_ota_abort(ota);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+        return ESP_FAIL;
+    }
+
+    /* ---- finalise ---- */
     if (esp_ota_end(ota) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid image");
         return ESP_FAIL;
@@ -1919,7 +2004,11 @@ static esp_err_t settings_import_post(httpd_req_t *req) {
 static void web_start(void){
     httpd_handle_t server=NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 40;
+    cfg.max_uri_handlers  = 40;
+    cfg.stack_size        = 8192;   /* default 4096 is too small when OTA buf is on stack */
+    cfg.recv_wait_timeout = 30;     /* seconds; default 5 s too short for slow WiFi OTA */
+    cfg.send_wait_timeout = 30;
+    cfg.lru_purge_enable  = true;   /* reclaim idle sockets if limit reached */
     cfg.open_fn  = httpd_open_fn;
     cfg.close_fn = httpd_close_fn;
     httpd_start(&server,&cfg);
