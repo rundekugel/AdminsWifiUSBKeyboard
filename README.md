@@ -11,3 +11,5 @@ idf.py set-target  esp32c3
 idf.py add-dependency "espressif/esp_tinyusb"
 idf.py set-target  esp32s3
 
+# Details
+[Help-file](doc/admin_keyboard_help.md)
