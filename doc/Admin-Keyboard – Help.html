@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<meta charset="UTF-8">
+<title>Admin-Keyboard – Help</title>
+<style>
+body{font-family:Arial;margin:20px;max-width:860px}
+h2{margin-bottom:4px}
+h3{margin:18px 0 6px;border-bottom:1px solid #ddd;padding-bottom:4px}
+h4{margin:12px 0 4px}
+#toc{background:#f8f8f8;border:1px solid #ddd;padding:10px 16px;border-radius:4px;margin:10px 0;display:inline-block;min-width:220px}
+#toc h3{margin:0 0 8px;border:none;padding:0;font-size:1em}
+#toc ol{margin:0;padding-left:20px}
+#toc li{margin:3px 0;font-size:0.9em}
+#toc a{text-decoration:none;color:#333}
+#toc a:hover{text-decoration:underline}
+.card{border:1px solid #ccc;padding:10px 16px;margin:10px 0;border-radius:4px}
+code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:0.92em}
+pre{background:#f5f5f5;padding:10px;border-radius:4px;overflow-x:auto;font-size:0.88em;line-height:1.5}
+table{border-collapse:collapse;width:100%;margin:6px 0}
+th{background:#f0f0f0;text-align:left}
+th,td{border:1px solid #ccc;padding:5px 8px;font-size:0.9em}
+.note{background:#fffbe6;border:1px solid #e6d800;padding:6px 10px;border-radius:4px;font-size:0.9em}
+</style>
+</head>
+<body>
+<h2>Admin-Keyboard – Help V0.5.1</h2>
+<p>Admin-Keyboard is an ESP32-S3 device that acts as a <strong>USB HID keyboard</strong> and is
+configured over a <strong>Wi-Fi web interface</strong>. Connect to it via its Wi-Fi access point
+(or your local network), open the web UI, and send keystrokes or run macros to the host PC.</p>
+
+<nav id="toc">
+<h3>Contents</h3>
+<ol>
+  <li><a href="#getting-started">Getting started</a></li>
+  <li><a href="#console">Console page</a>
+    <ol>
+      <li><a href="#status-bar">Status bar</a></li>
+      <li><a href="#send-keys">Send keys</a></li>
+      <li><a href="#lock-keys">Lock keys</a></li>
+      <li><a href="#media-keys">Media keys</a></li>
+      <li><a href="#macros-console">Macros</a></li>
+    </ol>
+  </li>
+  <li><a href="#macro-language">Macro script language</a>
+    <ol>
+      <li><a href="#key-names">Key names</a></li>
+      <li><a href="#modifier-names">Modifier names</a></li>
+      <li><a href="#media-names">Media key names</a></li>
+    </ol>
+  </li>
+  <li><a href="#wifi">Wi-Fi settings</a></li>
+  <li><a href="#usb-device">USB Device config</a></li>
+  <li><a href="#hardware">Hardware settings</a></li>
+</ol>
+</nav>
+
+<div class="card">
+<h3 id="getting-started">Getting started</h3>
+<ol>
+  <li>Power the device. It broadcasts a Wi-Fi access point (default SSID printed on the device or set in <a href="http://192.168.179.33/wifi">Wi-Fi Settings</a>).</li>
+  <li>Connect your phone or laptop to that AP.</li>
+  <li>Open <strong><a href="http://192.168.4.1/">http://192.168.4.1</a></strong> in a browser.</li>
+  <li>Plug the device into the target PC via the USB-OTG port — the status bar will show <em>USB HID: Enumerated</em> when the PC recognises it as a keyboard.</li>
+  <li>Type in the text area or run a macro — keystrokes are delivered to whatever is focused on the target PC.</li>
+</ol>
+<p class="note">The device can also join your existing Wi-Fi network (see <a href="http://192.168.179.33/wifi">Wi-Fi Settings</a>), making it reachable from anywhere on that network without connecting to the AP.</p>
+</div>
+
+<div class="card">
+<h3 id="console">Console page</h3>
+
+<h4 id="status-bar">Status bar</h4>
+<table>
+  <tbody><tr><th>Indicator</th><th>Meaning</th></tr>
+  <tr><td>USB HID</td><td>Whether the target PC has enumerated the keyboard. Keys only work when this is green.</td></tr>
+  <tr><td>Wi-Fi Clients</td><td>Number of devices connected to the built-in access point.</td></tr>
+  <tr><td>Wi-Fi STA</td><td>Whether the device itself is connected to an external Wi-Fi network, and its IP on that network.</td></tr>
+</tbody></table>
+
+<h4 id="send-keys">Send keys</h4>
+<p>Click in the text area and type. With <strong>Send keys immediately</strong> checked every keystroke
+is forwarded in real-time (including Ctrl, Shift, Alt combinations). Uncheck it to compose text
+first, then click <strong>Send as Text</strong> to type it all at once.</p>
+<p>Use the modifier checkboxes (<em>LCtrl, RCtrl, LShift, RShift, LAlt, RAlt, Super</em>) to hold
+extra modifiers that are combined with each key you press.</p>
+<p>Works on mobile too — the soft keyboard sends text via the input event path.</p>
+
+<h4 id="lock-keys">Lock keys</h4>
+<p>The <strong>NUM / CAPS / SCRL</strong> indicators reflect the lock-key state reported by the host.
+Click them to toggle the corresponding lock key on the host.</p>
+
+<h4 id="media-keys">Media keys</h4>
+<p>The media buttons send consumer-control HID reports: Play/Pause, Previous, Next, Mute,
+Volume&nbsp;Down, Volume&nbsp;Up.</p>
+
+<h4 id="macros-console">Macros</h4>
+<p>A macro is a named script stored in flash. Save up to 20 macros. Click <strong>Run</strong> to
+execute a macro; it runs in the background so you can continue using the UI.</p>
+</div>
+
+<div class="card">
+<h3 id="macro-language">Macro script language</h3>
+<p>Each line of a macro body is one command. Blank lines and unknown commands are ignored.</p>
+
+<table>
+  <tbody><tr><th>Command</th><th>Description</th><th>Example</th></tr>
+  <tr><td><code>STRING &lt;text&gt;</code></td><td>Type <em>text</em> character by character.</td><td><code>STRING hello world</code></td></tr>
+  <tr><td><code>KEY &lt;name&gt;</code></td><td>Press and release one key (no modifier).</td><td><code>KEY ENTER</code></td></tr>
+  <tr><td><code>COMBO &lt;mod&gt;+…+&lt;key&gt;</code></td><td>Hold modifiers and press a key simultaneously.</td><td><code>COMBO LCTRL+C</code></td></tr>
+  <tr><td><code>MEDIA &lt;name&gt;</code></td><td>Send a consumer-control (media) key.</td><td><code>MEDIA PLAY_PAUSE</code></td></tr>
+  <tr><td><code>DELAY &lt;ms&gt;</code></td><td>Wait <em>ms</em> milliseconds (max 30000).</td><td><code>DELAY 500</code></td></tr>
+</tbody></table>
+
+<h4>Example macro</h4>
+<pre>STRING Hello from macro!
+KEY ENTER
+DELAY 200
+COMBO LCTRL+S
+DELAY 1000
+MEDIA VOL_UP</pre>
+
+<h4 id="key-names">Key names (<code>KEY</code> / <code>COMBO</code>)</h4>
+<table>
+  <tbody><tr><th>Name(s)</th><th>Key</th></tr>
+  <tr><td><code>A</code>–<code>Z</code>, <code>a</code>–<code>z</code></td><td>Letter keys (physical position, no shift)</td></tr>
+  <tr><td><code>0</code>–<code>9</code></td><td>Digit keys</td></tr>
+  <tr><td><code>F1</code>–<code>F12</code></td><td>Function keys</td></tr>
+  <tr><td><code>ENTER</code>, <code>RETURN</code></td><td>Enter / Return</td></tr>
+  <tr><td><code>ESC</code>, <code>ESCAPE</code></td><td>Escape</td></tr>
+  <tr><td><code>BACKSPACE</code></td><td>Backspace</td></tr>
+  <tr><td><code>TAB</code></td><td>Tab</td></tr>
+  <tr><td><code>SPACE</code></td><td>Space bar</td></tr>
+  <tr><td><code>DELETE</code></td><td>Delete (forward delete)</td></tr>
+  <tr><td><code>INSERT</code></td><td>Insert</td></tr>
+  <tr><td><code>HOME</code></td><td>Home</td></tr>
+  <tr><td><code>END</code></td><td>End</td></tr>
+  <tr><td><code>PAGEUP</code></td><td>Page Up</td></tr>
+  <tr><td><code>PAGEDOWN</code></td><td>Page Down</td></tr>
+  <tr><td><code>UP</code>, <code>ARROWUP</code></td><td>Arrow Up</td></tr>
+  <tr><td><code>DOWN</code>, <code>ARROWDOWN</code></td><td>Arrow Down</td></tr>
+  <tr><td><code>LEFT</code>, <code>ARROWLEFT</code></td><td>Arrow Left</td></tr>
+  <tr><td><code>RIGHT</code>, <code>ARROWRIGHT</code></td><td>Arrow Right</td></tr>
+  <tr><td><code>CAPSLOCK</code></td><td>Caps Lock</td></tr>
+  <tr><td><code>NUMLOCK</code></td><td>Num Lock</td></tr>
+  <tr><td><code>SCROLLLOCK</code></td><td>Scroll Lock</td></tr>
+  <tr><td><code>PRINTSCREEN</code></td><td>Print Screen</td></tr>
+  <tr><td><code>PAUSE</code></td><td>Pause / Break</td></tr>
+  <tr><td><code>MINUS</code></td><td>- (minus)</td></tr>
+  <tr><td><code>EQUAL</code></td><td>= (equals)</td></tr>
+  <tr><td><code>BRACKETLEFT</code></td><td>[ (left bracket)</td></tr>
+  <tr><td><code>BRACKETRIGHT</code></td><td>] (right bracket)</td></tr>
+  <tr><td><code>BACKSLASH</code></td><td>\ (backslash)</td></tr>
+  <tr><td><code>SEMICOLON</code></td><td>; (semicolon)</td></tr>
+  <tr><td><code>APOSTROPHE</code>, <code>QUOTE</code></td><td>' (apostrophe)</td></tr>
+  <tr><td><code>GRAVE</code>, <code>BACKQUOTE</code></td><td>` (grave / backtick)</td></tr>
+  <tr><td><code>COMMA</code></td><td>, (comma)</td></tr>
+  <tr><td><code>PERIOD</code></td><td>. (period)</td></tr>
+  <tr><td><code>SLASH</code></td><td>/ (forward slash)</td></tr>
+  <tr><td><code>INTLBACKSLASH</code></td><td>ISO key between left Shift and Z (Europe key 2)</td></tr>
+</tbody></table>
+
+<h4 id="modifier-names">Modifier names (<code>COMBO</code>)</h4>
+<table>
+  <tbody><tr><th>Name(s)</th><th>Modifier</th></tr>
+  <tr><td><code>LCTRL</code>, <code>CTRL</code>, <code>CONTROL</code></td><td>Left Ctrl</td></tr>
+  <tr><td><code>RCTRL</code></td><td>Right Ctrl</td></tr>
+  <tr><td><code>LSHIFT</code>, <code>SHIFT</code></td><td>Left Shift</td></tr>
+  <tr><td><code>RSHIFT</code></td><td>Right Shift</td></tr>
+  <tr><td><code>LALT</code>, <code>ALT</code></td><td>Left Alt</td></tr>
+  <tr><td><code>RALT</code></td><td>Right Alt (AltGr)</td></tr>
+  <tr><td><code>SUPER</code>, <code>GUI</code>, <code>WIN</code>, <code>META</code></td><td>Left GUI (Windows / Command / Super)</td></tr>
+</tbody></table>
+
+<h4 id="media-names">Media key names (<code>MEDIA</code>)</h4>
+<table>
+  <tbody><tr><th>Name(s)</th><th>Action</th></tr>
+  <tr><td><code>PLAY_PAUSE</code>, <code>PLAY</code>, <code>PLAYPAUSE</code></td><td>Play / Pause</td></tr>
+  <tr><td><code>NEXT</code>, <code>NEXT_TRACK</code>, <code>FORWARD</code></td><td>Next track</td></tr>
+  <tr><td><code>PREV</code>, <code>PREV_TRACK</code>, <code>PREVIOUS</code>, <code>BACKWARD</code></td><td>Previous track</td></tr>
+  <tr><td><code>VOL_UP</code>, <code>VOLUME_UP</code>, <code>VOLUMEUP</code></td><td>Volume up</td></tr>
+  <tr><td><code>VOL_DOWN</code>, <code>VOLUME_DOWN</code>, <code>VOLUMEDOWN</code></td><td>Volume down</td></tr>
+  <tr><td><code>MUTE</code></td><td>Mute</td></tr>
+</tbody></table>
+</div>
+
+<div class="card">
+<h3 id="wifi">Wi-Fi settings</h3>
+
+<h4>Access Point (AP)</h4>
+<p>The device always runs its own AP so you can reach it even without an external network.
+Change the AP SSID and password in <a href="http://192.168.179.33/wifi">Wi-Fi Settings</a> → <em>Access Point</em>.
+Leave the password field empty for an open (no-password) network.
+Changes take effect after restart.</p>
+
+<h4>Station (STA) — joining an existing network</h4>
+<p>Use <em>Scan for Networks</em> to find nearby APs, select one, enter its password, and click
+<strong>Save &amp; Connect</strong>. The device will connect and show its IP in the status bar.
+Multiple networks can be saved; the device connects to the strongest known one automatically on boot.</p>
+<p>Saved networks are listed under <em>Saved Networks</em>. You can manually connect to or delete
+any entry there.</p>
+</div>
+
+<div class="card">
+<h3 id="usb-device">USB Device config</h3>
+<p>Accessible from <a href="http://192.168.179.33/usb">USB Device</a>. Changes take effect after restart.</p>
+<table>
+  <tbody><tr><th>Field</th><th>Description</th></tr>
+  <tr><td>VID</td><td>USB Vendor ID (hex, e.g. <code>16C0</code>). Identifies the device manufacturer to the host.</td></tr>
+  <tr><td>PID</td><td>USB Product ID (hex, e.g. <code>27DB</code>). Identifies the device model to the host.</td></tr>
+  <tr><td>Manufacturer</td><td>Manufacturer string shown in device manager.</td></tr>
+  <tr><td>Product</td><td>Product name string shown in device manager.</td></tr>
+  <tr><td>Serial Number</td><td>Serial number string.</td></tr>
+</tbody></table>
+</div>
+
+<div class="card">
+<h3 id="hardware">Hardware settings</h3>
+<p>Accessible from <a href="http://192.168.179.33/hw">Hardware</a>. Changes take effect after restart.</p>
+
+<h4>Status LED</h4>
+<table>
+  <tbody><tr><th>Field</th><th>Description</th></tr>
+  <tr><td>GPIO Pin</td><td>GPIO number for a status LED. <code>-1</code> = disabled.</td></tr>
+  <tr><td>NeoPixel (WS2812)</td><td>Drive the pin with WS2812 protocol via RMT instead of plain GPIO.</td></tr>
+  <tr><td>Invert (active-low)</td><td>Flip the GPIO level — use when the LED is connected between GPIO and VCC.</td></tr>
+</tbody></table>
+<table style="margin-top:6px">
+  <tbody><tr><th>State</th><th>Plain LED</th><th>NeoPixel colour</th></tr>
+  <tr><td>Booting / WPS active</td><td>2 Hz blink</td><td>Blue blink</td></tr>
+  <tr><td>Idle (no Wi-Fi)</td><td>Off</td><td>Off</td></tr>
+  <tr><td>Wi-Fi connected</td><td>Steady on</td><td>Steady green</td></tr>
+  <tr><td>Connecting (flash)</td><td>0.7 s pulse</td><td>0.7 s yellow pulse</td></tr>
+  <tr><td>Key being sent</td><td>Brief invert</td><td>Brief red flash</td></tr>
+</tbody></table>
+
+<h4>WPS Button</h4>
+<table>
+  <tbody><tr><th>Field</th><th>Description</th></tr>
+  <tr><td>GPIO Pin</td><td>GPIO for the WPS push-button. Default <code>0</code> (built-in BOOT button). <code>-1</code> = disabled.</td></tr>
+</tbody></table>
+<p>WPS can be triggered two ways:</p>
+<ul>
+  <li><strong>Hardware button:</strong> hold the configured GPIO low for <strong>3 seconds</strong>. The LED will fast-blink while searching.</li>
+  <li><strong>Web button:</strong> click <strong>WPS</strong> on the <a href="http://192.168.179.33/wifi">Wi-Fi Settings</a> page (next to Disconnect). The button disables itself and a status label appears while WPS is active.</li>
+</ul>
+<p>Once WPS completes the router's credentials are saved and the device connects automatically.
+The LED returns to normal state when WPS succeeds or times out (~2 min).</p>
+</div>
+
+
+
+</body></html>
