@@ -40,7 +40,7 @@ extern const unsigned char monitor_html_end[]   asm("_binary_monitor_html_end");
 extern const unsigned char ota_html_start[]     asm("_binary_ota_html_start");
 extern const unsigned char ota_html_end[]       asm("_binary_ota_html_end");
 
-#define VERSION "0.5.0b"
+#define VERSION "0.5.1"
 #define REVISION 0
 
 typedef struct {
@@ -1621,7 +1621,6 @@ static esp_err_t ota_upload_post(httpd_req_t *req) {
     const uint8_t key[] = OTA_AES_KEY;
     esp_aes_context aes; esp_aes_init(&aes);
     esp_aes_setkey(&aes, key, 256);
-    psa_crypto_init();
     psa_hash_operation_t sha = PSA_HASH_OPERATION_INIT;
     psa_hash_setup(&sha, PSA_ALG_SHA_256);
     psa_hash_update(&sha, iv, 16);
@@ -1644,7 +1643,8 @@ static esp_err_t ota_upload_post(httpd_req_t *req) {
        The last decrypted block is held back so PKCS#7 padding can be stripped. */
     uint8_t cbc_iv[16]; memcpy(cbc_iv, iv, 16);
     uint8_t pend[16];   int pend_n = 0;      /* partial ciphertext block accumulator */
-    uint8_t held[16];   bool have_held = false; /* last decrypted block (pending write) */
+    uint8_t held[16];   bool have_held = false; /* last decrypted block (not yet written) */
+    static uint8_t dec_buf[4096]; int dec_buf_n = 0; /* write buffer — flush in 4 KB chunks */
     bool    stream_ok   = true;
 
     while (enc_remaining > 0) {
@@ -1663,9 +1663,19 @@ static esp_err_t ota_upload_post(httpd_req_t *req) {
             if (pend_n == 16) {
                 uint8_t dec[16];
                 esp_aes_crypt_cbc(&aes, ESP_AES_DECRYPT, 16, cbc_iv, pend, dec);
-                if (have_held && esp_ota_write(ota, held, 16) != ESP_OK)
-                    stream_ok = false;
-                memcpy(held, dec, 16); have_held = true; pend_n = 0;
+                pend_n = 0;
+                /* flush previous held block into write buffer */
+                if (have_held) {
+                    memcpy(dec_buf + dec_buf_n, held, 16);
+                    dec_buf_n += 16;
+                    if (dec_buf_n >= 4096) {
+                        if (esp_ota_write(ota, dec_buf, dec_buf_n) != ESP_OK)
+                            stream_ok = false;
+                        dec_buf_n = 0;
+                    }
+                }
+                memcpy(held, dec, 16);
+                have_held = true;
             }
         }
     }
@@ -1682,14 +1692,18 @@ static esp_err_t ota_upload_post(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    /* ---- strip PKCS#7 padding from last block, write remainder ---- */
+    /* ---- strip PKCS#7 padding, append unpadded bytes to write buffer, flush ---- */
     int pad = held[15];
     if (pad < 1 || pad > 16) {
         esp_ota_abort(ota);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad padding");
         return ESP_FAIL;
     }
-    if (pad < 16 && esp_ota_write(ota, held, 16 - pad) != ESP_OK) {
+    if (pad < 16) {
+        memcpy(dec_buf + dec_buf_n, held, 16 - pad);
+        dec_buf_n += 16 - pad;
+    }
+    if (dec_buf_n > 0 && esp_ota_write(ota, dec_buf, dec_buf_n) != ESP_OK) {
         esp_ota_abort(ota);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
         return ESP_FAIL;
@@ -2119,6 +2133,7 @@ void app_main(void){
     xTaskCreate(hid_worker_task, "hid_worker", 4096, NULL, 5, NULL);
 
     esp_ota_mark_app_valid_cancel_rollback();
+    psa_crypto_init();
     hw_monitor_init();
     usb_hid_init();
     wifi_init_ap();
